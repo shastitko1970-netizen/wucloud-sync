@@ -9,17 +9,23 @@
                 <p class="wucloud-lead">
                     Бэкап в облако
                     <a href="https://wuproj.com/dashboard?tab=files" target="_blank" rel="noopener">WuProj · Файлы ИИ</a>.
-                    Один локальный файл → один облачный объект (без дублей).
+                    Ключ: только <b>wu-…</b> из Dashboard → API keys (не JWT и не пароль).
                 </p>
 
                 <div class="wucloud-field">
-                    <label for="wucloud_api_key">API-ключ (wu-… из кабинета)</label>
+                    <label for="wucloud_api_key">API-ключ (wu-…)</label>
                     <input type="password" id="wucloud_api_key" class="text_pole" placeholder="wu-..." autocomplete="off">
                 </div>
 
                 <div class="wucloud-field">
                     <label for="wucloud_base_url">API base URL</label>
                     <input type="text" id="wucloud_base_url" class="text_pole" placeholder="https://api.wuproj.com">
+                </div>
+
+                <div class="wucloud-buttons">
+                    <button id="wucloud_test_btn" class="menu_button" type="button">
+                        <i class="fa-solid fa-plug"></i> Проверить ключ
+                    </button>
                 </div>
 
                 <div class="wucloud-section-title">Что синхронизировать</div>
@@ -29,7 +35,7 @@
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_personas"> Personas (профили)</label>
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_lorebooks"> Лорбуки (World Info)</label>
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_presets"> Пресеты генерации</label>
-                    <label class="wucloud-check"><input type="checkbox" id="wucloud_use_gzip" checked> Gzip (подготовка; API пока принимает jsonl)</label>
+                    <label class="wucloud-check"><input type="checkbox" id="wucloud_use_gzip" checked> Gzip (сжатие на клиенте + gunzip на сервере)</label>
                 </div>
 
                 <div class="wucloud-section-title">Автосохранение диалогов</div>
@@ -47,16 +53,16 @@
                 </div>
 
                 <div class="wucloud-buttons">
-                    <button id="wucloud_push_btn" class="menu_button" title="Push по выбранным типам (текущий чат)">
+                    <button id="wucloud_push_btn" class="menu_button" type="button" title="Push по выбранным типам">
                         <i class="fa-solid fa-cloud-arrow-up"></i> Push
                     </button>
-                    <button id="wucloud_push_chat_btn" class="menu_button">
+                    <button id="wucloud_push_chat_btn" class="menu_button" type="button">
                         <i class="fa-solid fa-comment"></i> Текущий чат
                     </button>
-                    <button id="wucloud_push_all_chats_btn" class="menu_button" title="Все чаты текущего персонажа">
+                    <button id="wucloud_push_all_chats_btn" class="menu_button" type="button" title="Все чаты текущего персонажа">
                         <i class="fa-solid fa-comments"></i> Все чаты персонажа
                     </button>
-                    <button id="wucloud_pull_btn" class="menu_button" title="Список + импорт персонажей в ST">
+                    <button id="wucloud_pull_btn" class="menu_button" type="button" title="Pull из облака в ST">
                         <i class="fa-solid fa-cloud-arrow-down"></i> Pull
                     </button>
                 </div>
@@ -65,12 +71,10 @@
                 <div id="wucloud_log" class="wucloud-log"></div>
 
                 <div class="wucloud-foot">
-                    <span>v1.3.0</span>
-
+                    <span>v0.7.0</span>
                     ·
                     <a href="https://github.com/shastitko1970-netizen/wucloud-sync" target="_blank" rel="noopener">GitHub</a>
-                    ·
-                    ST: Extensions → Install extension → repo URL
+                    · branch: main / wucloud
                 </div>
             </div>
         </div>

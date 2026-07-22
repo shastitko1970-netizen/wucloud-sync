@@ -1,5 +1,7 @@
 # WuCloud Sync
 
+**Version:** 0.7.0  
+
 **SillyTavern extension** — cloud backup of characters, chats, personas, lorebooks and generation presets to [WuProj](https://wuproj.com) («Файлы ИИ»).
 
 > This repository contains **only** the SillyTavern extension (installable by Git URL).  
@@ -18,8 +20,15 @@ https://github.com/shastitko1970-netizen/wucloud-sync
 4. **Branch field:** leave empty, or use `main`, or `wucloud` (same code).  
    Do **not** invent other branch names — ST will fail with `Remote branch … not found`.
 5. Confirm install (all users / current user)
-5. Enable **WuCloud Sync** if needed
-6. Open the extension drawer → paste your **`wu-…` API key** from [WuProj dashboard](https://wuproj.com/dashboard)
+6. Enable **WuCloud Sync** if needed
+7. Open the extension drawer → paste your **`wu-…` API key** from [WuProj dashboard → API keys](https://wuproj.com/dashboard)
+8. Click **«Проверить ключ»** before Push
+
+### Auth notes
+
+- Key **must** start with `wu-` (API key from the dashboard).
+- Not a password, not a JWT, not a Telegram session.
+- If you see `401 Invalid API key` — recreate the key and paste again (no spaces/quotes).
 
 Requires **git** on the machine running SillyTavern.
 

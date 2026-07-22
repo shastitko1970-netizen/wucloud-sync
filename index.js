@@ -1,7 +1,8 @@
 /**
- * WuCloud Sync — SillyTavern extension v1.3.0
+ * WuCloud Sync — SillyTavern extension v0.7.0
  * Cloud backup to WuProj: characters, chats (lossless gzip blobs), personas, lorebooks, presets.
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
+ * Branch: main or wucloud
  */
 import { getContext, extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../script.js';
@@ -136,11 +137,39 @@ function toast(kind, msg) {
 }
 
 function baseUrl() {
-    return (getSettings().base_url || 'https://api.wuproj.com').replace(/\/+$/, '');
+    let u = (getSettings().base_url || 'https://api.wuproj.com').trim();
+    u = u.replace(/\/+$/, '');
+    // Common mistakes: pasted full chat path or missing scheme
+    u = u.replace(/\/v1(\/chat\/completions)?$/i, '');
+    u = u.replace(/\/api\/v2.*$/i, '');
+    if (u && !/^https?:\/\//i.test(u)) u = `https://${u}`;
+    return u || 'https://api.wuproj.com';
 }
 
+/** Normalize key from dashboard: strip Bearer/, quotes, whitespace. Must start with wu- */
 function apiKey() {
-    return (getSettings().api_key || '').trim();
+    let k = String(getSettings().api_key || '').trim();
+    k = k.replace(/^["']|["']$/g, '');
+    k = k.replace(/^Bearer\s+/i, '').trim();
+    // Some clients wrap as "Authorization: Bearer wu-..."
+    k = k.replace(/^Authorization:\s*Bearer\s+/i, '').trim();
+    return k;
+}
+
+function formatApiError(json, text, status) {
+    if (json && typeof json === 'object') {
+        // proxy writeError: { error: { message, type, code } }
+        if (json.error && typeof json.error === 'object') {
+            const m = json.error.message || json.error.type;
+            if (m) return String(m);
+            try { return JSON.stringify(json.error); } catch (_) { /* fallthrough */ }
+        }
+        if (typeof json.error === 'string') return json.error;
+        if (typeof json.message === 'string') return json.message;
+        try { return JSON.stringify(json); } catch (_) { /* fallthrough */ }
+    }
+    if (text && text.trim()) return text.slice(0, 300);
+    return status || 'unknown error';
 }
 
 async function sha256Hex(textOrBuf) {
@@ -151,37 +180,45 @@ async function sha256Hex(textOrBuf) {
     return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** Gzip string → Uint8Array using ST fflate if available, else raw UTF-8 */
+/** Gzip string → Uint8Array (ST fflate / CompressionStream). Always returns Uint8Array. */
 async function maybeGzip(text) {
     const s = getSettings();
+    const plain = new TextEncoder().encode(text);
     if (!s.use_gzip) {
-        return { bytes: new TextEncoder().encode(text), gzipped: false };
+        return { bytes: plain, gzipped: false };
     }
     const L = libs();
+    // SillyTavern exports gzipSync / gzip from fflate
     const gzipFn = L.gzipSync || L.gzip || null;
     if (typeof gzipFn === 'function') {
         try {
-            const input = new TextEncoder().encode(text);
-            const out = gzipFn(input);
-            return { bytes: out, gzipped: true };
+            const out = gzipFn(plain);
+            const bytes = out instanceof Uint8Array ? out : new Uint8Array(out);
+            if (bytes.length && bytes[0] === 0x1f && bytes[1] === 0x8b) {
+                return { bytes, gzipped: true };
+            }
         } catch (e) {
-            logLine(`gzip fallback: ${e.message}`);
+            logLine(`gzip(fflate): ${e.message}`);
         }
     }
-    // CompressionStream (modern browsers)
     if (typeof CompressionStream !== 'undefined') {
         try {
-            const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+            const stream = new Blob([plain]).stream().pipeThrough(new CompressionStream('gzip'));
             const ab = await new Response(stream).arrayBuffer();
             return { bytes: new Uint8Array(ab), gzipped: true };
-        } catch (_) { /* ignore */ }
+        } catch (e) {
+            logLine(`gzip(stream): ${e.message}`);
+        }
     }
-    return { bytes: new TextEncoder().encode(text), gzipped: false };
+    return { bytes: plain, gzipped: false };
 }
 
 async function apiFetch(path, { method = 'GET', body = null, formData = null } = {}) {
     const key = apiKey();
-    if (!key) throw new Error('Введите API-ключ wu-…');
+    if (!key) throw new Error('Введите API-ключ wu-… из кабинета WuProj (Dashboard → API keys)');
+    if (!key.startsWith('wu-')) {
+        throw new Error('Ключ должен начинаться с wu- (это API-ключ, не пароль и не JWT). Возьмите в Dashboard → API keys.');
+    }
 
     const headers = { Authorization: `Bearer ${key}` };
     let payload = body;
@@ -192,15 +229,44 @@ async function apiFetch(path, { method = 'GET', body = null, formData = null } =
         payload = JSON.stringify(body);
     }
 
-    const res = await fetch(`${baseUrl()}${path}`, { method, headers, body: payload });
+    const url = `${baseUrl()}${path}`;
+    let res;
+    try {
+        res = await fetch(url, { method, headers, body: payload });
+    } catch (e) {
+        throw new Error(`Сеть: ${e.message} (url=${url}). Проверьте base URL и CORS.`);
+    }
     const text = await res.text();
     let json = null;
     try { json = text ? JSON.parse(text) : null; } catch (_) { /* raw */ }
     if (!res.ok) {
-        const errMsg = (json && (json.error || json.message)) || text || res.statusText;
+        const errMsg = formatApiError(json, text, res.statusText);
+        if (res.status === 401) {
+            throw new Error(`401 Unauthorized: ${errMsg}. Проверьте ключ wu-… (скопируйте заново из кабинета, без пробелов).`);
+        }
         throw new Error(`${res.status}: ${errMsg}`);
     }
     return json;
+}
+
+/** Quick auth check against quotas endpoint */
+async function testConnection() {
+    setStatus('Проверка ключа…', 'busy');
+    try {
+        const key = apiKey();
+        if (!key) throw new Error('Введите API-ключ wu-…');
+        if (!key.startsWith('wu-')) throw new Error('Ключ должен начинаться с wu-');
+        logLine(`base=${baseUrl()} key=${key.slice(0, 6)}…${key.slice(-4)} (len=${key.length})`);
+        const q = await apiFetch('/api/v2/user/quotas');
+        const msg = `OK · auth · chats ${q?.usage?.chats ?? 0}/${q?.limits?.chats ?? '∞'} · sub=${!!q?.has_subscription}`;
+        setStatus(msg, 'ok');
+        toast('success', 'Ключ принят');
+        logLine(msg);
+    } catch (e) {
+        setStatus(e.message, 'err');
+        toast('error', e.message);
+        logLine(e.message);
+    }
 }
 
 // ─── Characters ───────────────────────────────────────────────────────────
@@ -1056,6 +1122,7 @@ function bindUi() {
     $('wucloud_push_all_chats_btn')?.addEventListener('click', () => syncPush({ allChats: true }));
     $('wucloud_push_chat_btn')?.addEventListener('click', () => syncPush({ onlyCurrentChat: true }));
     $('wucloud_pull_btn')?.addEventListener('click', () => syncPull({ importCharacters: true }));
+    $('wucloud_test_btn')?.addEventListener('click', () => testConnection());
 }
 
 async function init() {
@@ -1084,8 +1151,8 @@ async function init() {
     bindUi();
     bindEvents();
     setupIntervalAutosave();
-    setStatus('Готов · WuCloud Sync 1.3.0', 'ok');
-    console.log(LOG_PREFIX, 'loaded v1.3.0');
+    setStatus('Готов · WuCloud Sync 0.7.0', 'ok');
+    console.log(LOG_PREFIX, 'loaded v0.7.0');
 }
 
 if (document.readyState === 'loading') {
