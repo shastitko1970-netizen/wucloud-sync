@@ -1,5 +1,5 @@
 /**
- * WuCloud Sync — SillyTavern extension v0.7.3
+ * WuCloud Sync — SillyTavern extension v0.7.4
  * Cloud backup to WuProj: characters, chats (lossless gzip blobs), personas, lorebooks, presets.
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
  * Branch: main or wucloud
@@ -619,26 +619,37 @@ async function collectSTPersonas() {
 
     const personasMap = power.personas || {};
     const descriptions = power.persona_descriptions || power.personaDescriptions || {};
+    const isImg = (s) => typeof s === 'string' && /\.(png|jpe?g|webp|gif)$/i.test(s);
+
+    const descFor = (avatar, nameKey) => {
+        const descObj = descriptions[avatar] || descriptions[nameKey] || {};
+        if (typeof descObj === 'string') return descObj;
+        return descObj?.description || descObj?.prompt || power.persona_description || '';
+    };
 
     logLine(`personas debug: keys=${Object.keys(personasMap).length} descs=${Object.keys(descriptions).length} has_default_desc=${!!power.persona_description}`);
 
-    // Shape A: { "Display Name": "User Avatars/xxx.png" }
+    // ST native: power_user.personas maps avatarFile → displayName
+    // Also seen: displayName → avatarFile
     for (const [key, val] of Object.entries(personasMap)) {
-        if (typeof val === 'string' && /\.(png|jpe?g|webp|gif)$/i.test(val)) {
-            const avatar = val;
-            const descObj = descriptions[avatar] || descriptions[key] || {};
-            const description = typeof descObj === 'string'
-                ? descObj
-                : (descObj?.description || descObj?.prompt || power.persona_description || '');
-            add(key, description, avatar);
+        if (isImg(key) && typeof val === 'string' && !isImg(val)) {
+            // avatar → name
+            add(val || key, descFor(key, val), key);
+            continue;
+        }
+        if (typeof val === 'string' && isImg(val)) {
+            // name → avatar
+            add(key, descFor(val, key), val);
             continue;
         }
         if (typeof val === 'string') {
-            add(key, val, key);
+            // ambiguous: prefer key as name
+            add(key, val, isImg(key) ? key : undefined);
             continue;
         }
         if (val && typeof val === 'object') {
-            add(val.name || key, val.description || val.prompt || '', val.avatar || key);
+            const avatar = val.avatar || (isImg(key) ? key : undefined);
+            add(val.name || key, val.description || val.prompt || descFor(avatar, key), avatar);
         }
     }
 
@@ -648,7 +659,11 @@ async function collectSTPersonas() {
             ? descObj
             : (descObj?.description || descObj?.prompt || '');
         if (!description && !key) continue;
-        add(String(key).replace(/\.(png|jpe?g|webp|gif)$/i, ''), description, key);
+        // key is almost always avatar filename in ST
+        const display = isImg(key)
+            ? (typeof personasMap[key] === 'string' && !isImg(personasMap[key]) ? personasMap[key] : key.replace(/\.(png|jpe?g|webp|gif)$/i, ''))
+            : key;
+        add(display, description, isImg(key) ? key : undefined);
     }
 
     // Default persona text only
@@ -684,21 +699,34 @@ async function pushPersonas() {
 
     let n = 0, skipped = 0, errors = 0;
     for (const p of list) {
-        const name = p.name || 'Persona';
+        const name = (p.name && !/\.(png|jpe?g|webp|gif)$/i.test(p.name)) ? p.name : (p.name || 'Persona');
         const description = p.description || '';
-        const clientKey = `persona:${p.avatar || name}`;
-        const hash = await sha256Hex(JSON.stringify({ name, description }));
+        // v2: forces re-upload after persona name mapping fix
+        const clientKey = `persona:v2:${p.avatar || name}`;
+        // Full ST-shaped payload for lossless round-trip
+        const stPersona = {
+            name,
+            description,
+            avatar: p.avatar || '',
+            // ST persona_descriptions fields (best-effort)
+            position: 0,
+            depth: 4,
+            role: 0,
+            format: 'native',
+        };
+        const hash = await sha256Hex('v2|' + JSON.stringify(stPersona));
         if (mapGet(clientKey)?.content_hash === hash) {
             skipped++;
+            logLine(`persona skip (unchanged): ${name}`);
             continue;
         }
-        // Prefer blob for lossless; also personas/import for Dashboard
         try {
-            const payload = JSON.stringify({ name, description, avatar: p.avatar || '' });
+            const payload = JSON.stringify(stPersona, null, 0);
             const { bytes, gzipped } = await maybeGzip(payload);
+            const safe = String(name).replace(/[^\w\-а-яА-ЯёЁ]+/gi, '_').slice(0, 60) || 'persona';
             const fd = new FormData();
             fd.append('file', new Blob([bytes], { type: gzipped ? 'application/gzip' : 'application/json' }),
-                `${name.replace(/[^\w\-]+/g, '_')}.json${gzipped ? '.gz' : ''}`);
+                `${safe}.json${gzipped ? '.gz' : ''}`);
             fd.append('client_key', clientKey);
             fd.append('kind', 'persona_json');
             fd.append('name', name);
@@ -706,29 +734,36 @@ async function pushPersonas() {
             const blobRes = await apiFetch('/api/v2/st-sync/blobs', { method: 'POST', formData: fd });
             if (blobRes?.id) await mapSet(clientKey, blobRes.id, hash);
 
-            // Dashboard-visible persona row
-            const card = {
-                name,
-                description,
-                personality: '',
-                scenario: '',
-                first_mes: '',
-                mes_example: '',
-                spec: 'chara_card_v2',
-                spec_version: '2.0',
-                data: { name, description, personality: '', scenario: '' },
-            };
-            const fd2 = new FormData();
-            fd2.append('file', new Blob([JSON.stringify(card)], { type: 'application/json' }), `${name}.json`);
-            fd2.append('client_key', `platform:${clientKey}`);
-            fd2.append('content_hash', hash);
-            fd2.append('name', name);
-            fd2.append('description', description);
-            await apiFetch('/api/v2/personas/import', { method: 'POST', formData: fd2 });
+            // Dashboard row (plain text description — not a character card)
+            // Use create endpoint when possible to avoid card parser mangling
+            try {
+                await apiFetch('/api/v2/personas/create', {
+                    method: 'POST',
+                    body: { name, description, avatar_url: p.avatar || '' },
+                });
+            } catch (_) {
+                // fallback import
+                const card = {
+                    name,
+                    description,
+                    personality: '',
+                    scenario: '',
+                    first_mes: '',
+                    mes_example: '',
+                    data: { name, description },
+                };
+                const fd2 = new FormData();
+                fd2.append('file', new Blob([JSON.stringify(card)], { type: 'application/json' }), `${safe}.json`);
+                fd2.append('client_key', `platform:${clientKey}`);
+                fd2.append('content_hash', hash);
+                fd2.append('name', name);
+                fd2.append('description', description);
+                await apiFetch('/api/v2/personas/import', { method: 'POST', formData: fd2 });
+            }
 
             if (blobRes?.skipped) skipped++;
             else n++;
-            logLine(`persona OK: ${name}`);
+            logLine(`persona OK: ${name} (desc ${description.length} chars, avatar=${p.avatar || '—'})`);
         } catch (e) {
             errors++;
             logLine(`persona ${name}: ${e.message}`);
@@ -886,9 +921,11 @@ async function pushLorebooks() {
                 continue;
             }
             if (!book.name) book.name = name;
+            // Keep full raw ST book for lossless blob
             const payload = JSON.stringify(book);
-            const clientKey = `lorebook:${name}`;
-            const hash = await sha256Hex(payload);
+            // v2: after disable→enabled parser fix
+            const clientKey = `lorebook:v2:${name}`;
+            const hash = await sha256Hex('v2|' + payload);
             if (mapGet(clientKey)?.content_hash === hash) {
                 skipped++;
                 continue;
@@ -959,18 +996,41 @@ async function pushPresets() {
         for (const name of names) {
             if (!name) continue;
             try {
-                const data = pm.getPresetSettings?.(name)
-                    || pm.getCompletionPresetByName?.(name)
-                    || (typeof pm.getPreset === 'function' ? pm.getPreset(name) : null)
-                    || null;
+                let data = null;
+                // Prefer full named preset objects; avoid empty Default stubs
+                if (typeof pm.getCompletionPresetByName === 'function') {
+                    data = pm.getCompletionPresetByName(name);
+                }
+                if (!data && typeof pm.getPresetSettings === 'function') {
+                    data = pm.getPresetSettings(name);
+                }
+                if (!data && typeof pm.getPreset === 'function') {
+                    data = pm.getPreset(name);
+                }
+                // oai_settings may hold the active preset fields only
+                if ((!data || Object.keys(data).length < 3) && name !== 'Default') {
+                    try {
+                        const settings = await fetchSTSettings();
+                        const oai = settings?.oai_settings || settings?.openai_settings;
+                        if (oai && typeof oai === 'object' && (oai.preset_settings_openai === name || oai.preset_settings === name)) {
+                            data = { ...oai, name };
+                        }
+                    } catch (_) { /* ignore */ }
+                }
                 if (!data || typeof data !== 'object') {
                     logLine(`preset skip (no data): ${name}`);
                     continue;
                 }
+                const keys = Object.keys(data);
+                if (keys.length <= 2 && name === 'Default') {
+                    logLine(`preset skip (empty Default stub, keys=${keys.join(',')})`);
+                    continue;
+                }
                 const payloadObj = { ...data, name: data.name || name };
                 const payload = JSON.stringify(payloadObj);
-                const clientKey = `preset:${name}`;
-                const hash = await sha256Hex(payload);
+                logLine(`preset data: ${name} keys=${Object.keys(payloadObj).length} bytes=${payload.length}`);
+                const clientKey = `preset:v2:${name}`;
+                const hash = await sha256Hex('v2|' + payload);
                 if (mapGet(clientKey)?.content_hash === hash) {
                     skipped++;
                     continue;
@@ -1059,6 +1119,18 @@ async function fetchBlobText(id) {
     });
     if (!res.ok) throw new Error(`blob get ${res.status}`);
     return res.text();
+}
+
+function downloadJsonFile(name, obj) {
+    const blob = new Blob([typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${String(name || 'export').replace(/[^\w\-а-яА-ЯёЁ]+/gi, '_').slice(0, 60)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
 }
 
 /**
@@ -1230,45 +1302,96 @@ async function syncPull({ importCharacters = true } = {}) {
             }
         }
 
-        // Lorebooks
-        if (s.sync_lorebooks && (lore.lorebooks || []).length) {
-            for (const lb of lore.lorebooks) {
-                try {
-                    setStatus(`Pull lore: ${lb.name}…`, 'busy');
-                    const full = await apiFetch(`/api/v2/lorebooks/export?id=${lb.id}`);
-                    const r = await importLorebookToST(full);
-                    if (r.ok) imported++;
-                    else {
-                        downloads++;
-                        const blob = new Blob([JSON.stringify(full, null, 2)], { type: 'application/json' });
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement('a');
-                        a.href = url;
-                        a.download = `${(lb.name || 'lore').replace(/[^\w\-]+/g, '_')}.json`;
-                        document.body.appendChild(a);
-                        a.click();
-                        a.remove();
-                        URL.revokeObjectURL(url);
+        // Prefer lossless blobs for lore / persona / preset when present
+        const allBlobs = await apiFetch('/api/v2/st-sync/blobs').catch(() => ({ items: [] }));
+        const byKind = (k) => (allBlobs.items || []).filter(i => i.kind === k);
+
+        if (s.sync_lorebooks) {
+            const loreBlobs = byKind('lorebook_json');
+            if (loreBlobs.length) {
+                for (const item of loreBlobs) {
+                    try {
+                        setStatus(`Pull lore blob: ${item.name}…`, 'busy');
+                        const text = await fetchBlobText(item.id);
+                        const full = JSON.parse(text);
+                        const r = await importLorebookToST(full);
+                        if (r.ok) imported++;
+                        else {
+                            downloads++;
+                            downloadJsonFile(item.name || 'lore', full);
+                        }
+                    } catch (e) {
+                        failed++;
+                        logLine(`lore blob ${item.name}: ${e.message}`);
                     }
-                } catch (e) {
-                    failed++;
-                    logLine(`lore ${lb.name}: ${e.message}`);
+                }
+            } else if ((lore.lorebooks || []).length) {
+                for (const lb of lore.lorebooks) {
+                    try {
+                        setStatus(`Pull lore: ${lb.name}…`, 'busy');
+                        const full = await apiFetch(`/api/v2/lorebooks/export?id=${lb.id}`);
+                        const r = await importLorebookToST(full);
+                        if (r.ok) imported++;
+                        else {
+                            downloads++;
+                            downloadJsonFile(lb.name || 'lore', full);
+                        }
+                    } catch (e) {
+                        failed++;
+                        logLine(`lore ${lb.name}: ${e.message}`);
+                    }
                 }
             }
         }
 
-        // Presets
-        if (s.sync_presets && (presets.presets || []).length) {
-            for (const pr of presets.presets) {
+        if (s.sync_personas) {
+            const personaBlobs = byKind('persona_json');
+            for (const item of personaBlobs) {
                 try {
-                    setStatus(`Pull preset: ${pr.name}…`, 'busy');
-                    const full = await apiFetch(`/api/v2/presets/export?id=${pr.id}`).catch(() => pr);
-                    const r = await importPresetToST(full);
-                    if (r.ok) imported++;
-                    else downloads++;
+                    setStatus(`Pull persona blob: ${item.name}…`, 'busy');
+                    const text = await fetchBlobText(item.id);
+                    const full = JSON.parse(text);
+                    downloadJsonFile(item.name || 'persona', full);
+                    downloads++;
+                    logLine(`persona ${item.name}: скачан JSON (импорт в ST Persona — вручную / следующий релиз)`);
                 } catch (e) {
                     failed++;
-                    logLine(`preset ${pr.name}: ${e.message}`);
+                    logLine(`persona blob ${item.name}: ${e.message}`);
+                }
+            }
+        }
+
+        if (s.sync_presets) {
+            const presetBlobs = byKind('preset_json');
+            if (presetBlobs.length) {
+                for (const item of presetBlobs) {
+                    try {
+                        setStatus(`Pull preset blob: ${item.name}…`, 'busy');
+                        const text = await fetchBlobText(item.id);
+                        const full = JSON.parse(text);
+                        const r = await importPresetToST(full);
+                        if (r.ok) imported++;
+                        else {
+                            downloads++;
+                            downloadJsonFile(item.name || 'preset', full);
+                        }
+                    } catch (e) {
+                        failed++;
+                        logLine(`preset blob ${item.name}: ${e.message}`);
+                    }
+                }
+            } else if ((presets.presets || []).length) {
+                for (const pr of presets.presets) {
+                    try {
+                        setStatus(`Pull preset: ${pr.name}…`, 'busy');
+                        const full = await apiFetch(`/api/v2/presets/export?id=${pr.id}`).catch(() => pr);
+                        const r = await importPresetToST(full?.raw_data ? { ...full.raw_data, name: full.name } : full);
+                        if (r.ok) imported++;
+                        else downloads++;
+                    } catch (e) {
+                        failed++;
+                        logLine(`preset ${pr.name}: ${e.message}`);
+                    }
                 }
             }
         }
@@ -1302,7 +1425,8 @@ async function syncPush({ onlyCurrentChat = false, allChats = false } = {}) {
                 const r = await pushCurrentChat();
                 if (r?.skipped) stats.skipped++;
                 else stats.chats++;
-                logLine(r?.skipped ? `chat skip: ${r.reason || 'ok'}` : `chat → #${r?.chat_id}`);
+                const cid = r?.id ?? r?.chat_id ?? r?.blob_id;
+                logLine(r?.skipped ? `chat skip: ${r.reason || 'ok'}` : `chat → #${cid} (${r?.encoding || 'ok'})`);
             } catch (e) {
                 stats.errors++;
                 logLine(`chat error: ${e.message}`);
@@ -1325,7 +1449,8 @@ async function syncPush({ onlyCurrentChat = false, allChats = false } = {}) {
                     const r = await pushCurrentChat();
                     if (r?.skipped) stats.skipped++;
                     else stats.chats++;
-                    logLine(r?.skipped ? `chat skip: ${r.reason || 'ok'}` : `chat → #${r?.chat_id}`);
+                    const cid = r?.id ?? r?.chat_id ?? r?.blob_id;
+                    logLine(r?.skipped ? `chat skip: ${r.reason || 'ok'}` : `chat → #${cid} (${r?.encoding || 'ok'})`);
                 }
             } catch (e) {
                 stats.errors++;
@@ -1529,10 +1654,10 @@ async function init() {
     bindUi();
     bindEvents();
     setupIntervalAutosave();
-    logLine('WuCloud Sync 0.7.3 loaded · логи здесь + F12 Console [WuCloud], не в Server Log ST');
-    setStatus('Готов · WuCloud Sync 0.7.3', 'ok');
-    toast('info', 'WuCloud 0.7.3 · журнал в настройках расширения');
-    console.log(LOG_PREFIX, 'loaded v0.7.3');
+    logLine('WuCloud Sync 0.7.4 loaded · fix persona names, lore disable→enabled, chat id log, preset body');
+    setStatus('Готов · WuCloud Sync 0.7.4', 'ok');
+    toast('info', 'WuCloud 0.7.4 · журнал в настройках расширения');
+    console.log(LOG_PREFIX, 'loaded v0.7.4');
 }
 
 if (document.readyState === 'loading') {
