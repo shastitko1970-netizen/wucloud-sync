@@ -1,5 +1,5 @@
 /**
- * WuCloud Sync — SillyTavern extension v0.7.2
+ * WuCloud Sync — SillyTavern extension v0.7.3
  * Cloud backup to WuProj: characters, chats (lossless gzip blobs), personas, lorebooks, presets.
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
  * Branch: main or wucloud
@@ -109,32 +109,121 @@ async function mapSet(key, cloudId, hash) {
     await saveMap();
 }
 
+/** Ring buffer — survives re-render; shown in panel + Copy/Full */
+const LOG_MAX = 400;
+/** @type {string[]} */
+const logBuffer = [];
+
 function setStatus(msg, kind = '') {
     const el = document.getElementById('wucloud_status');
+    if (el) {
+        el.textContent = msg;
+        el.classList.remove('is-ok', 'is-err', 'is-busy');
+        if (kind) el.classList.add(`is-${kind}`);
+    }
+    // Also mirror important status into ST toasts (server log still won't show this)
+    if (kind === 'err') toast('error', msg);
+    else if (kind === 'ok' && /OK|Готово|синхрон/i.test(msg)) toast('success', msg.slice(0, 120));
+}
+
+function renderLogPanel() {
+    const el = document.getElementById('wucloud_log');
     if (!el) return;
-    el.textContent = msg;
-    el.classList.remove('is-ok', 'is-err', 'is-busy');
-    if (kind) el.classList.add(`is-${kind}`);
+    // newest first
+    el.textContent = logBuffer.join('\n');
+    el.scrollTop = 0;
 }
 
 function logLine(line) {
-    const el = document.getElementById('wucloud_log');
-    if (!el) return;
     const t = new Date().toLocaleTimeString();
-    el.textContent = `[${t}] ${line}\n` + (el.textContent || '');
-    console.log(LOG_PREFIX, line);
+    const row = `[${t}] ${line}`;
+    logBuffer.unshift(row);
+    if (logBuffer.length > LOG_MAX) logBuffer.length = LOG_MAX;
+    renderLogPanel();
+    // Browser console (F12) — not ST Server Log
+    try { console.log(LOG_PREFIX, line); } catch (_) { /* ignore */ }
+}
+
+function getLogText() {
+    return logBuffer.join('\n');
+}
+
+async function copyLog() {
+    const text = getLogText();
+    if (!text) {
+        toast('warning', 'Журнал пуст');
+        return;
+    }
+    try {
+        await navigator.clipboard.writeText(text);
+        toast('success', 'Журнал скопирован');
+    } catch (_) {
+        // Fallback prompt
+        try {
+            const c = ctx();
+            if (c.Popup?.show?.input) {
+                await c.Popup.show.input('WuCloud journal', 'Скопируй вручную:', text);
+            } else {
+                prompt('Скопируй журнал:', text);
+            }
+        } catch (e) {
+            prompt('Скопируй журнал:', text);
+        }
+    }
+}
+
+function clearLog() {
+    logBuffer.length = 0;
+    renderLogPanel();
+    setStatus('Журнал очищен', 'ok');
+}
+
+async function showLogPopup() {
+    const text = getLogText() || '(пусто)';
+    try {
+        const c = ctx();
+        if (c.Popup?.show?.text) {
+            await c.Popup.show.text('WuCloud journal', `<pre class="wucloud-log-popup-body">${escapeHtml(text)}</pre>`);
+            return;
+        }
+        if (c.Popup) {
+            const popup = new c.Popup(
+                `<pre class="wucloud-log-popup-body">${escapeHtml(text)}</pre>`,
+                c.POPUP_TYPE?.TEXT ?? 1,
+                '',
+                { okButton: 'Close', wide: true, allowVerticalScrolling: true },
+            );
+            await popup.show();
+            return;
+        }
+    } catch (e) {
+        console.warn(LOG_PREFIX, 'popup log failed', e);
+    }
+    // Last resort
+    alert(text.slice(0, 4000));
+}
+
+function escapeHtml(s) {
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
 }
 
 function toast(kind, msg) {
+    const m = String(msg || '').slice(0, 200);
     try {
         if (typeof toastr !== 'undefined') {
-            if (kind === 'error') toastr.error(msg);
-            else if (kind === 'warning') toastr.warning(msg);
-            else toastr.success(msg);
+            if (kind === 'error') toastr.error(m, 'WuCloud', { timeOut: 8000 });
+            else if (kind === 'warning') toastr.warning(m, 'WuCloud', { timeOut: 6000 });
+            else if (kind === 'info') toastr.info(m, 'WuCloud', { timeOut: 4000 });
+            else toastr.success(m, 'WuCloud', { timeOut: 4000 });
             return;
         }
     } catch (_) { /* ignore */ }
-    logLine(msg);
+    // ensure something visible even without toastr
+    if (kind === 'error') logLine(`TOAST/ERR: ${m}`);
 }
 
 function baseUrl() {
@@ -1408,6 +1497,10 @@ function bindUi() {
     $('wucloud_push_chat_btn')?.addEventListener('click', () => syncPush({ onlyCurrentChat: true }));
     $('wucloud_pull_btn')?.addEventListener('click', () => syncPull({ importCharacters: true }));
     $('wucloud_test_btn')?.addEventListener('click', () => testConnection());
+    $('wucloud_log_copy')?.addEventListener('click', () => copyLog());
+    $('wucloud_log_clear')?.addEventListener('click', () => clearLog());
+    $('wucloud_log_popup')?.addEventListener('click', () => showLogPopup());
+    renderLogPanel();
 }
 
 async function init() {
@@ -1436,8 +1529,10 @@ async function init() {
     bindUi();
     bindEvents();
     setupIntervalAutosave();
-    setStatus('Готов · WuCloud Sync 0.7.2', 'ok');
-    console.log(LOG_PREFIX, 'loaded v0.7.2');
+    logLine('WuCloud Sync 0.7.3 loaded · логи здесь + F12 Console [WuCloud], не в Server Log ST');
+    setStatus('Готов · WuCloud Sync 0.7.3', 'ok');
+    toast('info', 'WuCloud 0.7.3 · журнал в настройках расширения');
+    console.log(LOG_PREFIX, 'loaded v0.7.3');
 }
 
 if (document.readyState === 'loading') {

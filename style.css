@@ -12,6 +12,27 @@
     line-height: 1.4;
 }
 
+.wucloud-panel .wucloud-hint {
+    margin: 0;
+    padding: 8px 10px;
+    font-size: 0.8em;
+    line-height: 1.4;
+    border-radius: 8px;
+    background: color-mix(in srgb, #f59e0b 12%, transparent);
+    border: 1px dashed color-mix(in srgb, #f59e0b 45%, transparent);
+}
+
+.wucloud-panel .wucloud-hint code {
+    font-size: 0.95em;
+}
+
+.wucloud-panel .wucloud-ver-badge {
+    font-size: 0.75em;
+    font-weight: 600;
+    opacity: 0.75;
+    margin-left: 4px;
+}
+
 .wucloud-panel .wucloud-field {
     display: flex;
     flex-direction: column;
@@ -22,13 +43,31 @@
 .wucloud-panel .wucloud-section-title {
     font-size: 0.85em;
     font-weight: 600;
-    opacity: 0.85;
+    opacity: 0.9;
 }
 
 .wucloud-panel .wucloud-section-title {
     margin-top: 6px;
     padding-top: 8px;
     border-top: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor, #666) 50%, transparent);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.wucloud-panel .wucloud-log-actions {
+    display: inline-flex;
+    gap: 4px;
+}
+
+.wucloud-panel .wucloud-mini-btn {
+    flex: 0 0 auto !important;
+    padding: 2px 8px !important;
+    min-height: 0 !important;
+    font-size: 0.75em !important;
+    line-height: 1.4 !important;
 }
 
 .wucloud-panel .wucloud-toggles {
@@ -69,34 +108,65 @@
 
 .wucloud-panel .wucloud-status {
     margin-top: 4px;
-    padding: 8px 10px;
+    padding: 10px 12px;
     border-radius: 8px;
-    font-size: 0.9em;
+    font-size: 0.92em;
+    font-weight: 600;
     text-align: center;
     background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #222) 70%, transparent);
-    border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor, #444) 60%, transparent);
+    border: 2px solid color-mix(in srgb, var(--SmartThemeBorderColor, #444) 60%, transparent);
+    word-break: break-word;
 }
 
 .wucloud-panel .wucloud-status.is-ok {
-    border-color: color-mix(in srgb, #22c55e 50%, transparent);
+    border-color: color-mix(in srgb, #22c55e 70%, transparent);
+    color: #86efac;
 }
 
 .wucloud-panel .wucloud-status.is-err {
-    border-color: color-mix(in srgb, #ef4444 55%, transparent);
+    border-color: color-mix(in srgb, #ef4444 70%, transparent);
+    color: #fca5a5;
 }
 
 .wucloud-panel .wucloud-status.is-busy {
-    border-color: color-mix(in srgb, #a855f7 55%, transparent);
+    border-color: color-mix(in srgb, #a855f7 70%, transparent);
+    color: #d8b4fe;
 }
 
 .wucloud-panel .wucloud-log {
-    max-height: 140px;
+    max-height: 280px;
+    min-height: 120px;
     overflow: auto;
-    font-size: 0.78em;
+    margin: 0;
+    padding: 10px 12px;
+    font-size: 0.8em;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    opacity: 0.8;
+    line-height: 1.45;
     white-space: pre-wrap;
-    line-height: 1.35;
+    word-break: break-word;
+    border-radius: 8px;
+    background: color-mix(in srgb, #000 35%, var(--SmartThemeBlurTintColor, #1a1a1a));
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor, #555) 70%, transparent);
+    color: var(--SmartThemeBodyColor, #e5e5e5);
+}
+
+.wucloud-panel .wucloud-log:empty::before {
+    content: "Журнал пуст. Нажми «Проверить ключ» или Push — строки появятся здесь.";
+    opacity: 0.55;
+    font-style: italic;
+}
+
+.wucloud-log-popup-body {
+    max-height: 60vh;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.85em;
+    line-height: 1.4;
+    text-align: left;
+    margin: 0;
+    padding: 8px;
 }
 
 .wucloud-panel .wucloud-foot {

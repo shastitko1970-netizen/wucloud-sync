@@ -1,7 +1,7 @@
 <div id="wucloud-sync-panel" class="wucloud-panel">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b><i class="fa-solid fa-cloud"></i> WuCloud Sync</b>
+            <b><i class="fa-solid fa-cloud"></i> WuCloud Sync <span class="wucloud-ver-badge">0.7.3</span></b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content" style="display: none;">
@@ -9,7 +9,11 @@
                 <p class="wucloud-lead">
                     Бэкап в облако
                     <a href="https://wuproj.com/dashboard?tab=files" target="_blank" rel="noopener">WuProj · Файлы ИИ</a>.
-                    Ключ: только <b>wu-…</b> из Dashboard → API keys (не JWT и не пароль).
+                    Ключ: только <b>wu-…</b> из Dashboard → API keys.
+                </p>
+                <p class="wucloud-hint">
+                    Логи мода <b>не</b> пишутся в Server log ST — смотри блок «Журнал» ниже или toasts.
+                    F12 → Console тоже показывает <code>[WuCloud]</code>.
                 </p>
 
                 <div class="wucloud-field">
@@ -35,7 +39,7 @@
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_personas" checked> Personas (профили)</label>
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_lorebooks" checked> Лорбуки (World Info)</label>
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_presets" checked> Пресеты генерации</label>
-                    <label class="wucloud-check"><input type="checkbox" id="wucloud_use_gzip" checked> Gzip (сжатие на клиенте + gunzip на сервере)</label>
+                    <label class="wucloud-check"><input type="checkbox" id="wucloud_use_gzip" checked> Gzip</label>
                 </div>
 
                 <div class="wucloud-section-title">Автосохранение диалогов</div>
@@ -53,25 +57,34 @@
                 </div>
 
                 <div class="wucloud-buttons">
-                    <button id="wucloud_push_btn" class="menu_button" type="button" title="Push по выбранным типам">
+                    <button id="wucloud_push_btn" class="menu_button" type="button">
                         <i class="fa-solid fa-cloud-arrow-up"></i> Push
                     </button>
                     <button id="wucloud_push_chat_btn" class="menu_button" type="button">
                         <i class="fa-solid fa-comment"></i> Текущий чат
                     </button>
-                    <button id="wucloud_push_all_chats_btn" class="menu_button" type="button" title="Все чаты текущего персонажа">
+                    <button id="wucloud_push_all_chats_btn" class="menu_button" type="button">
                         <i class="fa-solid fa-comments"></i> Все чаты персонажа
                     </button>
-                    <button id="wucloud_pull_btn" class="menu_button" type="button" title="Pull из облака в ST">
+                    <button id="wucloud_pull_btn" class="menu_button" type="button">
                         <i class="fa-solid fa-cloud-arrow-down"></i> Pull
                     </button>
                 </div>
 
-                <div id="wucloud_status" class="wucloud-status">Готов</div>
-                <div id="wucloud_log" class="wucloud-log"></div>
+                <div id="wucloud_status" class="wucloud-status" role="status">Готов</div>
+
+                <div class="wucloud-section-title">
+                    Журнал WuCloud
+                    <span class="wucloud-log-actions">
+                        <button type="button" id="wucloud_log_copy" class="menu_button wucloud-mini-btn" title="Скопировать журнал">Copy</button>
+                        <button type="button" id="wucloud_log_clear" class="menu_button wucloud-mini-btn" title="Очистить">Clear</button>
+                        <button type="button" id="wucloud_log_popup" class="menu_button wucloud-mini-btn" title="Открыть большим окном">Full</button>
+                    </span>
+                </div>
+                <pre id="wucloud_log" class="wucloud-log" aria-live="polite"></pre>
 
                 <div class="wucloud-foot">
-                    <span>v0.7.2</span>
+                    <span>v0.7.3</span>
                     ·
                     <a href="https://github.com/shastitko1970-netizen/wucloud-sync" target="_blank" rel="noopener">GitHub</a>
                     · branch: main / wucloud
