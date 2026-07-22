@@ -1,5 +1,5 @@
 /**
- * WuCloud Sync — SillyTavern extension v0.7.0
+ * WuCloud Sync — SillyTavern extension v0.7.1
  * Cloud backup to WuProj: characters, chats (lossless gzip blobs), personas, lorebooks, presets.
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
  * Branch: main or wucloud
@@ -17,9 +17,10 @@ const defaultSettings = Object.freeze({
     base_url: 'https://api.wuproj.com',
     sync_characters: true,
     sync_chats: true,
-    sync_personas: false,
-    sync_lorebooks: false,
-    sync_presets: false,
+    // Enabled by default so Push does not silently skip these (user can uncheck)
+    sync_personas: true,
+    sync_lorebooks: true,
+    sync_presets: true,
     autosave: 'off', // off | message | interval
     debounce_sec: 8,
     use_gzip: true,
@@ -479,58 +480,132 @@ async function pushAllChatsForCurrentCharacter() {
 
 // ─── Personas ─────────────────────────────────────────────────────────────
 
-async function pushPersonas() {
+/**
+ * Collect ST user personas.
+ * ST stores them as power_user.personas (name→avatar) + persona_descriptions (avatar→{description}).
+ */
+async function collectSTPersonas() {
     const c = ctx();
     const power = c.powerUser || c.power_user || {};
-    const personas = power.personas || {};
-    const descriptions = power.persona_descriptions || {};
-    let n = 0, skipped = 0;
+    /** @type {Array<{name:string, description:string, avatar?:string}>} */
+    const out = [];
 
-    for (const name of Object.keys(personas)) {
-        const descObj = descriptions[name] || {};
+    const personasMap = power.personas || {};
+    const descriptions = power.persona_descriptions || {};
+
+    // Shape A: { "Display Name": "avatar.png" }
+    for (const [key, val] of Object.entries(personasMap)) {
+        if (typeof val === 'string' && (val.endsWith('.png') || val.endsWith('.jpg') || val.includes('.'))) {
+            const avatar = val;
+            const descObj = descriptions[avatar] || descriptions[key] || {};
+            const description = typeof descObj === 'string'
+                ? descObj
+                : (descObj.description || descObj.prompt || power.persona_description || '');
+            out.push({ name: key, description: String(description || ''), avatar });
+            continue;
+        }
+        // Shape B: { "avatar.png": "description" }
+        if (typeof val === 'string') {
+            out.push({ name: key, description: val, avatar: key });
+            continue;
+        }
+        // Shape C: nested object
+        if (val && typeof val === 'object') {
+            out.push({
+                name: val.name || key,
+                description: val.description || val.prompt || '',
+                avatar: val.avatar || key,
+            });
+        }
+    }
+
+    // Also descriptions without personas map entry
+    for (const [key, descObj] of Object.entries(descriptions)) {
+        if (out.some(p => p.avatar === key || p.name === key)) continue;
         const description = typeof descObj === 'string'
             ? descObj
             : (descObj.description || descObj.prompt || '');
-        const clientKey = `persona:${name}`;
+        if (!description) continue;
+        out.push({ name: key.replace(/\.(png|jpg|webp)$/i, ''), description: String(description), avatar: key });
+    }
+
+    // Default single persona_description
+    if (!out.length && power.persona_description) {
+        out.push({
+            name: power.user_name || c.name1 || 'User',
+            description: String(power.persona_description),
+        });
+    }
+
+    return out;
+}
+
+async function pushPersonas() {
+    let list = await collectSTPersonas();
+    logLine(`personas found in ST: ${list.length}`);
+    if (!list.length) {
+        logLine('personas: в ST не найдено (Persona Management пуст или другой формат)');
+        return { pushed: 0, skipped: 0, empty: true };
+    }
+
+    let n = 0, skipped = 0, errors = 0;
+    for (const p of list) {
+        const name = p.name || 'Persona';
+        const description = p.description || '';
+        const clientKey = `persona:${p.avatar || name}`;
         const hash = await sha256Hex(JSON.stringify({ name, description }));
         if (mapGet(clientKey)?.content_hash === hash) {
             skipped++;
             continue;
         }
-        const card = {
-            name,
-            description,
-            personality: '',
-            scenario: '',
-            first_mes: '',
-            mes_example: '',
-            spec: 'chara_card_v2',
-            spec_version: '2.0',
-            data: { name, description, personality: '', scenario: '' },
-        };
-        const blob = new Blob([JSON.stringify(card)], { type: 'application/json' });
-        const fd = new FormData();
-        fd.append('file', blob, `${name}.json`);
-        fd.append('client_key', clientKey);
-        fd.append('content_hash', hash);
-        fd.append('name', name);
-        fd.append('description', description);
+        // Prefer blob for lossless; also personas/import for Dashboard
         try {
-            const res = await apiFetch('/api/v2/personas/import', { method: 'POST', formData: fd });
-            const id = res?.persona?.id || res?.id;
-            if (id) await mapSet(clientKey, id, hash);
-            if (res?.skipped) skipped++;
+            const payload = JSON.stringify({ name, description, avatar: p.avatar || '' });
+            const { bytes, gzipped } = await maybeGzip(payload);
+            const fd = new FormData();
+            fd.append('file', new Blob([bytes], { type: gzipped ? 'application/gzip' : 'application/json' }),
+                `${name.replace(/[^\w\-]+/g, '_')}.json${gzipped ? '.gz' : ''}`);
+            fd.append('client_key', clientKey);
+            fd.append('kind', 'persona_json');
+            fd.append('name', name);
+            fd.append('content_hash', hash);
+            const blobRes = await apiFetch('/api/v2/st-sync/blobs', { method: 'POST', formData: fd });
+            if (blobRes?.id) await mapSet(clientKey, blobRes.id, hash);
+
+            // Dashboard-visible persona row
+            const card = {
+                name,
+                description,
+                personality: '',
+                scenario: '',
+                first_mes: '',
+                mes_example: '',
+                spec: 'chara_card_v2',
+                spec_version: '2.0',
+                data: { name, description, personality: '', scenario: '' },
+            };
+            const fd2 = new FormData();
+            fd2.append('file', new Blob([JSON.stringify(card)], { type: 'application/json' }), `${name}.json`);
+            fd2.append('client_key', `platform:${clientKey}`);
+            fd2.append('content_hash', hash);
+            fd2.append('name', name);
+            fd2.append('description', description);
+            await apiFetch('/api/v2/personas/import', { method: 'POST', formData: fd2 });
+
+            if (blobRes?.skipped) skipped++;
             else n++;
+            logLine(`persona OK: ${name}`);
         } catch (e) {
+            errors++;
             logLine(`persona ${name}: ${e.message}`);
         }
     }
-    return { pushed: n, skipped };
+    return { pushed: n, skipped, errors };
 }
 
 // ─── Lorebooks ────────────────────────────────────────────────────────────
 
-async function pushLorebooks() {
+async function listSTWorldInfoNames() {
     const c = ctx();
     let names = [];
     try {
@@ -539,36 +614,78 @@ async function pushLorebooks() {
             || (typeof world_names !== 'undefined' ? world_names : [])
             || [];
     } catch (_) { /* ignore */ }
+    if (!Array.isArray(names)) names = [];
 
-    if (!Array.isArray(names) || !names.length) {
-        // Try selected world
+    // ST HTTP list
+    if (!names.length) {
+        for (const url of ['/api/worldinfo/get', '/api/worldinfo/list']) {
+            try {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({}),
+                });
+                if (!res.ok) continue;
+                const data = await res.json();
+                if (Array.isArray(data)) names = data.map(x => (typeof x === 'string' ? x : x.name)).filter(Boolean);
+                else if (Array.isArray(data?.list)) names = data.list;
+                else if (Array.isArray(data?.world_names)) names = data.world_names;
+                if (names.length) break;
+            } catch (_) { /* next */ }
+        }
+    }
+
+    if (!names.length) {
         const selected = c.worldInfoSettings?.world_info?.globalSelect
             || c.selected_world
             || null;
         if (selected) names = Array.isArray(selected) ? selected : [selected];
     }
+    return [...new Set(names.filter(Boolean))];
+}
 
-    let n = 0, skipped = 0;
-    for (const name of names) {
-        if (!name) continue;
+async function loadSTWorldInfo(name) {
+    const c = ctx();
+    if (typeof c.loadWorldInfo === 'function') {
         try {
-            let book = null;
-            if (typeof c.loadWorldInfo === 'function') {
-                book = await c.loadWorldInfo(name);
+            const book = await c.loadWorldInfo(name);
+            if (book) return book;
+        } catch (_) { /* fallthrough */ }
+    }
+    for (const body of [{ name }, { worldInfoName: name }, { file: name }]) {
+        try {
+            const res = await fetch('/api/worldinfo/get', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            if (res.ok) {
+                const book = await res.json();
+                if (book && (book.entries || book.name || Object.keys(book).length)) return book;
             }
+        } catch (_) { /* next */ }
+    }
+    return null;
+}
+
+async function pushLorebooks() {
+    const names = await listSTWorldInfoNames();
+    logLine(`lorebooks found in ST: ${names.length}${names.length ? ' · ' + names.slice(0, 5).join(', ') : ''}`);
+    if (!names.length) {
+        logLine('lorebooks: в ST не найдено World Info (создай/открой лорбук)');
+        return { pushed: 0, skipped: 0, empty: true };
+    }
+
+    let n = 0, skipped = 0, errors = 0;
+    for (const name of names) {
+        try {
+            const book = await loadSTWorldInfo(name);
             if (!book) {
-                // ST server API
-                const res = await fetch('/api/worldinfo/get', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name }),
-                });
-                if (res.ok) book = await res.json();
-            }
-            if (!book) {
-                skipped++;
+                logLine(`lorebook skip (load failed): ${name}`);
+                errors++;
                 continue;
             }
+            if (!book.name) book.name = name;
             const payload = JSON.stringify(book);
             const clientKey = `lorebook:${name}`;
             const hash = await sha256Hex(payload);
@@ -576,69 +693,116 @@ async function pushLorebooks() {
                 skipped++;
                 continue;
             }
-            const blob = new Blob([payload], { type: 'application/json' });
+            // Lossless blob
+            const { bytes, gzipped } = await maybeGzip(payload);
             const fd = new FormData();
-            fd.append('file', blob, `${name}.json`);
+            fd.append('file', new Blob([bytes], { type: gzipped ? 'application/gzip' : 'application/json' }),
+                `${String(name).replace(/[^\w\-]+/g, '_')}.json${gzipped ? '.gz' : ''}`);
             fd.append('client_key', clientKey);
+            fd.append('kind', 'lorebook_json');
+            fd.append('name', name);
             fd.append('content_hash', hash);
-            const res = await apiFetch('/api/v2/lorebooks/import', { method: 'POST', formData: fd });
-            const id = res?.id;
-            if (id) await mapSet(clientKey, id, hash);
-            if (res?.skipped) skipped++;
+            const blobRes = await apiFetch('/api/v2/st-sync/blobs', { method: 'POST', formData: fd });
+            if (blobRes?.id) await mapSet(clientKey, blobRes.id, hash);
+
+            // Dashboard import
+            const fd2 = new FormData();
+            fd2.append('file', new Blob([payload], { type: 'application/json' }), `${name}.json`);
+            fd2.append('client_key', `platform:${clientKey}`);
+            fd2.append('content_hash', hash);
+            await apiFetch('/api/v2/lorebooks/import', { method: 'POST', formData: fd2 });
+
+            if (blobRes?.skipped) skipped++;
             else n++;
+            logLine(`lorebook OK: ${name}`);
         } catch (e) {
+            errors++;
             logLine(`lorebook ${name}: ${e.message}`);
         }
     }
-    return { pushed: n, skipped };
+    return { pushed: n, skipped, errors };
 }
 
 // ─── Presets ──────────────────────────────────────────────────────────────
 
 async function pushPresets() {
     const c = ctx();
-    let n = 0, skipped = 0;
+    let n = 0, skipped = 0, errors = 0;
     try {
-        const pm = c.getPresetManager?.();
-        if (!pm) return { pushed: 0, skipped: 0, reason: 'no preset manager' };
+        const pm = typeof c.getPresetManager === 'function' ? c.getPresetManager() : null;
+        if (!pm) {
+            logLine('presets: getPresetManager() недоступен (открой Chat Completion API)');
+            return { pushed: 0, skipped: 0, empty: true };
+        }
 
         let names = [];
         if (typeof pm.getAllPresets === 'function') {
-            names = pm.getAllPresets() || [];
+            const all = pm.getAllPresets() || [];
+            names = all.map(x => (typeof x === 'string' ? x : x?.name)).filter(Boolean);
         }
-        const current = pm.getSelectedPresetName?.();
+        const current = pm.getSelectedPresetName?.() || pm.getPresetName?.();
         if (current && !names.includes(current)) names.push(current);
-        if (!names.length && current) names = [current];
+        // Some ST versions expose oai_settings.preset_settings_names
+        try {
+            const oai = c.oai_settings || c.openai_setting_names;
+            if (Array.isArray(oai)) {
+                for (const x of oai) if (x && !names.includes(x)) names.push(x);
+            }
+        } catch (_) { /* ignore */ }
+
+        logLine(`presets found in ST: ${names.length}${names.length ? ' · ' + names.slice(0, 8).join(', ') : ''}`);
+        if (!names.length) {
+            logLine('presets: список пуст');
+            return { pushed: 0, skipped: 0, empty: true };
+        }
 
         for (const name of names) {
-            if (!name || name === 'Default') continue;
-            const data = pm.getPresetSettings?.(name)
-                || pm.getCompletionPresetByName?.(name)
-                || null;
-            if (!data || typeof data !== 'object') continue;
+            if (!name) continue;
+            try {
+                const data = pm.getPresetSettings?.(name)
+                    || pm.getCompletionPresetByName?.(name)
+                    || (typeof pm.getPreset === 'function' ? pm.getPreset(name) : null)
+                    || null;
+                if (!data || typeof data !== 'object') {
+                    logLine(`preset skip (no data): ${name}`);
+                    continue;
+                }
+                const payloadObj = { ...data, name: data.name || name };
+                const payload = JSON.stringify(payloadObj);
+                const clientKey = `preset:${name}`;
+                const hash = await sha256Hex(payload);
+                if (mapGet(clientKey)?.content_hash === hash) {
+                    skipped++;
+                    continue;
+                }
+                // Blob lossless
+                const { bytes, gzipped } = await maybeGzip(payload);
+                const fd = new FormData();
+                fd.append('file', new Blob([bytes], { type: gzipped ? 'application/gzip' : 'application/json' }),
+                    `${String(name).replace(/[^\w\-]+/g, '_')}.json${gzipped ? '.gz' : ''}`);
+                fd.append('client_key', clientKey);
+                fd.append('kind', 'preset_json');
+                fd.append('name', name);
+                fd.append('content_hash', hash);
+                const blobRes = await apiFetch('/api/v2/st-sync/blobs', { method: 'POST', formData: fd });
+                if (blobRes?.id) await mapSet(clientKey, blobRes.id, hash);
 
-            const payloadObj = { ...data, name: data.name || name };
-            const payload = JSON.stringify(payloadObj);
-            const clientKey = `preset:${name}`;
-            const hash = await sha256Hex(payload);
-            if (mapGet(clientKey)?.content_hash === hash) {
-                skipped++;
-                continue;
+                const q = new URLSearchParams({ client_key: `platform:${clientKey}`, content_hash: hash });
+                await apiFetch(`/api/v2/presets/import?${q}`, { method: 'POST', body: payloadObj });
+
+                if (blobRes?.skipped) skipped++;
+                else n++;
+                logLine(`preset OK: ${name}`);
+            } catch (e) {
+                errors++;
+                logLine(`preset ${name}: ${e.message}`);
             }
-            const q = new URLSearchParams({ client_key: clientKey, content_hash: hash });
-            const res = await apiFetch(`/api/v2/presets/import?${q}`, {
-                method: 'POST',
-                body: payloadObj,
-            });
-            const id = res?.preset?.id || res?.id;
-            if (id) await mapSet(clientKey, id, hash);
-            if (res?.skipped) skipped++;
-            else n++;
         }
     } catch (e) {
-        logLine(`preset: ${e.message}`);
+        logLine(`presets: ${e.message}`);
+        errors++;
     }
-    return { pushed: n, skipped };
+    return { pushed: n, skipped, errors };
 }
 
 // ─── Pull (download into ST) ──────────────────────────────────────────────
@@ -930,6 +1094,7 @@ async function syncPush({ onlyCurrentChat = false, allChats = false } = {}) {
     setStatus('Синхронизация…', 'busy');
     const s = getSettings();
     const stats = { characters: 0, chats: 0, personas: 0, lorebooks: 0, presets: 0, skipped: 0, errors: 0 };
+    logLine(`push flags: char=${!!s.sync_characters} chat=${!!s.sync_chats} persona=${!!s.sync_personas} lore=${!!s.sync_lorebooks} preset=${!!s.sync_presets} gzip=${!!s.use_gzip}`);
 
     try {
         if (onlyCurrentChat) {
@@ -988,10 +1153,13 @@ async function syncPush({ onlyCurrentChat = false, allChats = false } = {}) {
                 const r = await pushPersonas();
                 stats.personas += r.pushed || 0;
                 stats.skipped += r.skipped || 0;
+                stats.errors += r.errors || 0;
             } catch (e) {
                 stats.errors++;
                 logLine(`personas: ${e.message}`);
             }
+        } else {
+            logLine('personas: выкл в настройках мода (галочка)');
         }
 
         if (s.sync_lorebooks) {
@@ -999,10 +1167,13 @@ async function syncPush({ onlyCurrentChat = false, allChats = false } = {}) {
                 const r = await pushLorebooks();
                 stats.lorebooks += r.pushed || 0;
                 stats.skipped += r.skipped || 0;
+                stats.errors += r.errors || 0;
             } catch (e) {
                 stats.errors++;
                 logLine(`lorebooks: ${e.message}`);
             }
+        } else {
+            logLine('lorebooks: выкл в настройках мода (галочка)');
         }
 
         if (s.sync_presets) {
@@ -1010,10 +1181,13 @@ async function syncPush({ onlyCurrentChat = false, allChats = false } = {}) {
                 const r = await pushPresets();
                 stats.presets += r.pushed || 0;
                 stats.skipped += r.skipped || 0;
+                stats.errors += r.errors || 0;
             } catch (e) {
                 stats.errors++;
                 logLine(`presets: ${e.message}`);
             }
+        } else {
+            logLine('presets: выкл в настройках мода (галочка)');
         }
 
         const summary = `Готово · char ${stats.characters} · chat ${stats.chats} · persona ${stats.personas} · lore ${stats.lorebooks} · preset ${stats.presets} · skip ${stats.skipped} · err ${stats.errors}`;
@@ -1151,8 +1325,8 @@ async function init() {
     bindUi();
     bindEvents();
     setupIntervalAutosave();
-    setStatus('Готов · WuCloud Sync 0.7.0', 'ok');
-    console.log(LOG_PREFIX, 'loaded v0.7.0');
+    setStatus('Готов · WuCloud Sync 0.7.1', 'ok');
+    console.log(LOG_PREFIX, 'loaded v0.7.1');
 }
 
 if (document.readyState === 'loading') {
