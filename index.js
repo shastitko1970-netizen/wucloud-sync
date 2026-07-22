@@ -1,5 +1,5 @@
 /**
- * WuCloud Sync — SillyTavern extension v0.7.4
+ * WuCloud Sync — SillyTavern extension v0.7.5
  * Cloud backup to WuProj: characters, chats (lossless gzip blobs), personas, lorebooks, presets.
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
  * Branch: main or wucloud
@@ -942,16 +942,21 @@ async function pushLorebooks() {
             const blobRes = await apiFetch('/api/v2/st-sync/blobs', { method: 'POST', formData: fd });
             if (blobRes?.id) await mapSet(clientKey, blobRes.id, hash);
 
-            // Dashboard import
-            const fd2 = new FormData();
-            fd2.append('file', new Blob([payload], { type: 'application/json' }), `${name}.json`);
-            fd2.append('client_key', `platform:${clientKey}`);
-            fd2.append('content_hash', hash);
-            await apiFetch('/api/v2/lorebooks/import', { method: 'POST', formData: fd2 });
+            // Dashboard dual-write is best-effort (large books can fail CORS/timeout — blob is source of truth)
+            try {
+                const fd2 = new FormData();
+                fd2.append('file', new Blob([payload], { type: 'application/json' }), `${name}.json`);
+                fd2.append('client_key', `platform:${clientKey}`);
+                fd2.append('content_hash', hash);
+                await apiFetch('/api/v2/lorebooks/import', { method: 'POST', formData: fd2 });
+            } catch (e) {
+                logLine(`lorebook dashboard preview skip (${name}): ${e.message}`);
+            }
 
             if (blobRes?.skipped) skipped++;
             else n++;
-            logLine(`lorebook OK: ${name}`);
+            const ent = book.entries ? (Array.isArray(book.entries) ? book.entries.length : Object.keys(book.entries).length) : 0;
+            logLine(`lorebook OK: ${name} (entries≈${ent}, blob #${blobRes?.id ?? '—'}, ${payload.length}b)`);
         } catch (e) {
             errors++;
             logLine(`lorebook ${name}: ${e.message}`);
@@ -1654,10 +1659,10 @@ async function init() {
     bindUi();
     bindEvents();
     setupIntervalAutosave();
-    logLine('WuCloud Sync 0.7.4 loaded · fix persona names, lore disable→enabled, chat id log, preset body');
-    setStatus('Готов · WuCloud Sync 0.7.4', 'ok');
-    toast('info', 'WuCloud 0.7.4 · журнал в настройках расширения');
-    console.log(LOG_PREFIX, 'loaded v0.7.4');
+    logLine('WuCloud Sync 0.7.5 loaded · lore dual-write best-effort (blob is source of truth)');
+    setStatus('Готов · WuCloud Sync 0.7.5', 'ok');
+    toast('info', 'WuCloud 0.7.5');
+    console.log(LOG_PREFIX, 'loaded v0.7.5');
 }
 
 if (document.readyState === 'loading') {
