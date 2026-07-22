@@ -1,0 +1,111 @@
+.wucloud-panel .wucloud-settings {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 8px 4px 12px;
+}
+
+.wucloud-panel .wucloud-lead {
+    margin: 0 0 4px;
+    font-size: 0.9em;
+    opacity: 0.9;
+    line-height: 1.4;
+}
+
+.wucloud-panel .wucloud-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.wucloud-panel .wucloud-field label,
+.wucloud-panel .wucloud-section-title {
+    font-size: 0.85em;
+    font-weight: 600;
+    opacity: 0.85;
+}
+
+.wucloud-panel .wucloud-section-title {
+    margin-top: 6px;
+    padding-top: 8px;
+    border-top: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor, #666) 50%, transparent);
+}
+
+.wucloud-panel .wucloud-toggles {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.wucloud-panel .wucloud-check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    font-size: 0.92em;
+    user-select: none;
+}
+
+.wucloud-panel .wucloud-check input {
+    width: 1rem;
+    height: 1rem;
+    accent-color: var(--SmartThemeQuoteColor, #8b5cf6);
+}
+
+.wucloud-panel .wucloud-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 4px;
+}
+
+.wucloud-panel .wucloud-buttons .menu_button {
+    flex: 1 1 120px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+}
+
+.wucloud-panel .wucloud-status {
+    margin-top: 4px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    font-size: 0.9em;
+    text-align: center;
+    background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #222) 70%, transparent);
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor, #444) 60%, transparent);
+}
+
+.wucloud-panel .wucloud-status.is-ok {
+    border-color: color-mix(in srgb, #22c55e 50%, transparent);
+}
+
+.wucloud-panel .wucloud-status.is-err {
+    border-color: color-mix(in srgb, #ef4444 55%, transparent);
+}
+
+.wucloud-panel .wucloud-status.is-busy {
+    border-color: color-mix(in srgb, #a855f7 55%, transparent);
+}
+
+.wucloud-panel .wucloud-log {
+    max-height: 140px;
+    overflow: auto;
+    font-size: 0.78em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    opacity: 0.8;
+    white-space: pre-wrap;
+    line-height: 1.35;
+}
+
+.wucloud-panel .wucloud-foot {
+    font-size: 0.75em;
+    opacity: 0.65;
+    text-align: center;
+    margin-top: 2px;
+}
+
+.wucloud-panel .wucloud-foot a {
+    text-decoration: underline;
+}

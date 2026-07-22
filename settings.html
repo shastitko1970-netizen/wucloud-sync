@@ -1,0 +1,73 @@
+<div id="wucloud-sync-panel" class="wucloud-panel">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b><i class="fa-solid fa-cloud"></i> WuCloud Sync</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content" style="display: none;">
+            <div class="wucloud-settings">
+                <p class="wucloud-lead">
+                    Бэкап персонажей, диалогов и пресетов в облако
+                    <a href="https://wuproj.com/dashboard?tab=files" target="_blank" rel="noopener">WuProj · Файлы ИИ</a>.
+                    Без дублей: один локальный файл → один облачный объект.
+                </p>
+
+                <div class="wucloud-field">
+                    <label for="wucloud_api_key">API-ключ (wu-… из кабинета)</label>
+                    <input type="password" id="wucloud_api_key" class="text_pole" placeholder="wu-..." autocomplete="off">
+                </div>
+
+                <div class="wucloud-field">
+                    <label for="wucloud_base_url">API base URL</label>
+                    <input type="text" id="wucloud_base_url" class="text_pole" placeholder="https://api.wuproj.com">
+                </div>
+
+                <div class="wucloud-section-title">Что синхронизировать</div>
+                <div class="wucloud-toggles">
+                    <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_characters" checked> Персонажи (карты)</label>
+                    <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_chats" checked> Диалоги (чаты)</label>
+                    <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_personas"> Personas (профили)</label>
+                    <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_lorebooks"> Лорбуки (World Info)</label>
+                    <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_presets"> Пресеты генерации</label>
+                </div>
+
+                <div class="wucloud-section-title">Автосохранение диалогов</div>
+                <div class="wucloud-field">
+                    <label for="wucloud_autosave">Режим</label>
+                    <select id="wucloud_autosave" class="text_pole">
+                        <option value="off">Выкл</option>
+                        <option value="message">После сообщения (debounce)</option>
+                        <option value="interval">По таймеру</option>
+                    </select>
+                </div>
+                <div class="wucloud-field">
+                    <label for="wucloud_debounce_ms">Debounce / интервал (сек)</label>
+                    <input type="number" id="wucloud_debounce_ms" class="text_pole" min="2" max="300" value="8">
+                </div>
+
+                <div class="wucloud-buttons">
+                    <button id="wucloud_push_btn" class="menu_button">
+                        <i class="fa-solid fa-cloud-arrow-up"></i> Push в облако
+                    </button>
+                    <button id="wucloud_push_chat_btn" class="menu_button">
+                        <i class="fa-solid fa-comments"></i> Только текущий чат
+                    </button>
+                    <button id="wucloud_pull_btn" class="menu_button">
+                        <i class="fa-solid fa-cloud-arrow-down"></i> Pull (список)
+                    </button>
+                </div>
+
+                <div id="wucloud_status" class="wucloud-status">Готов</div>
+                <div id="wucloud_log" class="wucloud-log"></div>
+
+                <div class="wucloud-foot">
+                    <span>v1.1.0</span>
+                    ·
+                    <a href="https://github.com/shastitko1970-netizen/wucloud-sync" target="_blank" rel="noopener">GitHub</a>
+                    ·
+                    Install: Extensions → Install extension → repo URL
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
