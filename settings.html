@@ -7,9 +7,9 @@
         <div class="inline-drawer-content" style="display: none;">
             <div class="wucloud-settings">
                 <p class="wucloud-lead">
-                    Бэкап персонажей, диалогов и пресетов в облако
+                    Бэкап в облако
                     <a href="https://wuproj.com/dashboard?tab=files" target="_blank" rel="noopener">WuProj · Файлы ИИ</a>.
-                    Без дублей: один локальный файл → один облачный объект.
+                    Один локальный файл → один облачный объект (без дублей).
                 </p>
 
                 <div class="wucloud-field">
@@ -29,6 +29,7 @@
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_personas"> Personas (профили)</label>
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_lorebooks"> Лорбуки (World Info)</label>
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_presets"> Пресеты генерации</label>
+                    <label class="wucloud-check"><input type="checkbox" id="wucloud_use_gzip" checked> Gzip (подготовка; API пока принимает jsonl)</label>
                 </div>
 
                 <div class="wucloud-section-title">Автосохранение диалогов</div>
@@ -46,14 +47,17 @@
                 </div>
 
                 <div class="wucloud-buttons">
-                    <button id="wucloud_push_btn" class="menu_button">
-                        <i class="fa-solid fa-cloud-arrow-up"></i> Push в облако
+                    <button id="wucloud_push_btn" class="menu_button" title="Push по выбранным типам (текущий чат)">
+                        <i class="fa-solid fa-cloud-arrow-up"></i> Push
                     </button>
                     <button id="wucloud_push_chat_btn" class="menu_button">
-                        <i class="fa-solid fa-comments"></i> Только текущий чат
+                        <i class="fa-solid fa-comment"></i> Текущий чат
                     </button>
-                    <button id="wucloud_pull_btn" class="menu_button">
-                        <i class="fa-solid fa-cloud-arrow-down"></i> Pull (список)
+                    <button id="wucloud_push_all_chats_btn" class="menu_button" title="Все чаты текущего персонажа">
+                        <i class="fa-solid fa-comments"></i> Все чаты персонажа
+                    </button>
+                    <button id="wucloud_pull_btn" class="menu_button" title="Список + импорт персонажей в ST">
+                        <i class="fa-solid fa-cloud-arrow-down"></i> Pull
                     </button>
                 </div>
 
@@ -61,11 +65,12 @@
                 <div id="wucloud_log" class="wucloud-log"></div>
 
                 <div class="wucloud-foot">
-                    <span>v1.1.0</span>
+                    <span>v1.2.0</span>
+
                     ·
                     <a href="https://github.com/shastitko1970-netizen/wucloud-sync" target="_blank" rel="noopener">GitHub</a>
                     ·
-                    Install: Extensions → Install extension → repo URL
+                    ST: Extensions → Install extension → repo URL
                 </div>
             </div>
         </div>

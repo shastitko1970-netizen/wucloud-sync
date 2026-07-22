@@ -1,6 +1,6 @@
 /**
- * WuCloud Sync — SillyTavern extension
- * Cloud backup to WuProj (api.wuproj.com): characters, chats, personas, lorebooks, presets.
+ * WuCloud Sync — SillyTavern extension v1.2.0
+ * Cloud backup to WuProj: characters, chats, personas, lorebooks, presets.
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
  */
 import { getContext, extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
@@ -9,6 +9,7 @@ import { saveSettingsDebounced } from '../../../../script.js';
 const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
+const MAP_KEY = `${MODULE}_id_map`;
 
 const defaultSettings = Object.freeze({
     api_key: '',
@@ -20,10 +21,12 @@ const defaultSettings = Object.freeze({
     sync_presets: false,
     autosave: 'off', // off | message | interval
     debounce_sec: 8,
-    /** @type {Record<string, { cloud_id?: number, content_hash?: string }>} */
-    map: {},
+    use_gzip: true,
 });
 
+/** @type {Record<string, { cloud_id?: number, content_hash?: string }>} */
+let idMap = {};
+let mapLoaded = false;
 let autosaveTimer = null;
 let intervalHandle = null;
 let pushInFlight = false;
@@ -37,27 +40,71 @@ function ctx() {
     return getContext();
 }
 
+function libs() {
+    try {
+        return (typeof SillyTavern !== 'undefined' && SillyTavern.libs) ? SillyTavern.libs : {};
+    } catch (_) {
+        return {};
+    }
+}
+
 function getSettings() {
     if (!extension_settings[MODULE]) {
         extension_settings[MODULE] = structuredClone(defaultSettings);
     }
+    // migrate legacy map out of settings into localforage
+    const s = extension_settings[MODULE];
     for (const key of Object.keys(defaultSettings)) {
-        if (!Object.hasOwn(extension_settings[MODULE], key)) {
-            extension_settings[MODULE][key] = structuredClone(defaultSettings[key]);
-        }
+        if (!Object.hasOwn(s, key)) s[key] = structuredClone(defaultSettings[key]);
     }
-    if (!extension_settings[MODULE].map || typeof extension_settings[MODULE].map !== 'object') {
-        extension_settings[MODULE].map = {};
+    if (s.map && typeof s.map === 'object' && Object.keys(s.map).length) {
+        idMap = { ...idMap, ...s.map };
+        delete s.map;
+        persist();
+        saveMap().catch(() => {});
     }
-    return extension_settings[MODULE];
+    return s;
 }
 
 function persist() {
+    try { saveSettingsDebounced(); } catch (e) { console.warn(LOG_PREFIX, e); }
+}
+
+async function loadMap() {
+    if (mapLoaded) return idMap;
     try {
-        saveSettingsDebounced();
+        const lf = libs().localforage;
+        if (lf) {
+            const stored = await lf.getItem(MAP_KEY);
+            if (stored && typeof stored === 'object') idMap = stored;
+        } else {
+            const raw = localStorage.getItem(MAP_KEY);
+            if (raw) idMap = JSON.parse(raw);
+        }
     } catch (e) {
-        console.warn(LOG_PREFIX, 'saveSettingsDebounced failed', e);
+        console.warn(LOG_PREFIX, 'map load', e);
     }
+    mapLoaded = true;
+    return idMap;
+}
+
+async function saveMap() {
+    try {
+        const lf = libs().localforage;
+        if (lf) await lf.setItem(MAP_KEY, idMap);
+        else localStorage.setItem(MAP_KEY, JSON.stringify(idMap));
+    } catch (e) {
+        console.warn(LOG_PREFIX, 'map save', e);
+    }
+}
+
+function mapGet(key) {
+    return idMap[key] || null;
+}
+
+async function mapSet(key, cloudId, hash) {
+    idMap[key] = { cloud_id: cloudId, content_hash: hash };
+    await saveMap();
 }
 
 function setStatus(msg, kind = '') {
@@ -76,29 +123,60 @@ function logLine(line) {
     console.log(LOG_PREFIX, line);
 }
 
+function toast(kind, msg) {
+    try {
+        if (typeof toastr !== 'undefined') {
+            if (kind === 'error') toastr.error(msg);
+            else if (kind === 'warning') toastr.warning(msg);
+            else toastr.success(msg);
+            return;
+        }
+    } catch (_) { /* ignore */ }
+    logLine(msg);
+}
+
 function baseUrl() {
-    const s = getSettings();
-    return (s.base_url || 'https://api.wuproj.com').replace(/\/+$/, '');
+    return (getSettings().base_url || 'https://api.wuproj.com').replace(/\/+$/, '');
 }
 
 function apiKey() {
     return (getSettings().api_key || '').trim();
 }
 
-async function sha256Hex(text) {
-    const data = new TextEncoder().encode(text);
+async function sha256Hex(textOrBuf) {
+    const data = typeof textOrBuf === 'string'
+        ? new TextEncoder().encode(textOrBuf)
+        : (textOrBuf instanceof ArrayBuffer ? new Uint8Array(textOrBuf) : textOrBuf);
     const buf = await crypto.subtle.digest('SHA-256', data);
     return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function mapGet(key) {
-    return getSettings().map[key] || null;
-}
-
-function mapSet(key, cloudId, hash) {
+/** Gzip string → Uint8Array using ST fflate if available, else raw UTF-8 */
+async function maybeGzip(text) {
     const s = getSettings();
-    s.map[key] = { cloud_id: cloudId, content_hash: hash };
-    persist();
+    if (!s.use_gzip) {
+        return { bytes: new TextEncoder().encode(text), gzipped: false };
+    }
+    const L = libs();
+    const gzipFn = L.gzipSync || L.gzip || null;
+    if (typeof gzipFn === 'function') {
+        try {
+            const input = new TextEncoder().encode(text);
+            const out = gzipFn(input);
+            return { bytes: out, gzipped: true };
+        } catch (e) {
+            logLine(`gzip fallback: ${e.message}`);
+        }
+    }
+    // CompressionStream (modern browsers)
+    if (typeof CompressionStream !== 'undefined') {
+        try {
+            const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+            const ab = await new Response(stream).arrayBuffer();
+            return { bytes: new Uint8Array(ab), gzipped: true };
+        } catch (_) { /* ignore */ }
+    }
+    return { bytes: new TextEncoder().encode(text), gzipped: false };
 }
 
 async function apiFetch(path, { method = 'GET', body = null, formData = null } = {}) {
@@ -109,7 +187,7 @@ async function apiFetch(path, { method = 'GET', body = null, formData = null } =
     let payload = body;
     if (formData) {
         payload = formData;
-    } else if (body && typeof body === 'object' && !(body instanceof Blob)) {
+    } else if (body && typeof body === 'object' && !(body instanceof Blob) && !(body instanceof Uint8Array)) {
         headers['Content-Type'] = 'application/json';
         payload = JSON.stringify(body);
     }
@@ -130,8 +208,7 @@ async function apiFetch(path, { method = 'GET', body = null, formData = null } =
 async function pushCharacter(char) {
     if (!char?.avatar) return { skipped: true, reason: 'no avatar' };
     const clientKey = `char:${char.avatar}`;
-    const avatarUrl = `/characters/${char.avatar}`;
-    const avatarRes = await fetch(avatarUrl);
+    const avatarRes = await fetch(`/characters/${char.avatar}`);
     if (!avatarRes.ok) return { skipped: true, reason: 'avatar fetch failed' };
 
     const blob = await avatarRes.blob();
@@ -146,38 +223,28 @@ async function pushCharacter(char) {
     }
 
     const fd = new FormData();
-    fd.append('file', blob, char.avatar.endsWith('.png') ? char.avatar : `${char.avatar}.png`);
+    const fname = char.avatar.endsWith('.png') ? char.avatar : `${char.avatar}.png`;
+    fd.append('file', blob, fname);
     fd.append('client_key', clientKey);
     fd.append('content_hash', hash);
 
     const res = await apiFetch('/api/v2/characters/import', { method: 'POST', formData: fd });
     const id = res?.id || res?.data?.id;
-    if (id) mapSet(clientKey, id, hash);
+    if (id) await mapSet(clientKey, id, hash);
     return res;
 }
 
-// ─── Chats (JSONL) ────────────────────────────────────────────────────────
+// ─── Chats ────────────────────────────────────────────────────────────────
 
-function currentChatFileName(c) {
-    // ST exposes chat file name in various places depending on version
-    return c?.chatMetadata?.file_name
-        || c?.name2
-        || (c?.characters?.[c?.characterId]?.avatar || 'chat')
-        || 'chat';
-}
-
-function buildChatJsonl(c) {
-    const chat = c.chat || [];
-    // Minimal ST-compatible lines: metadata + messages with mes
+function buildChatJsonlFromArray(chatArr, meta = {}) {
     const lines = [];
-    const meta = {
-        user_name: c.name1 || 'User',
-        character_name: c.name2 || 'Character',
+    lines.push(JSON.stringify({
+        user_name: meta.user_name || 'User',
+        character_name: meta.character_name || 'Character',
         create_date: Date.now(),
-        chat_metadata: c.chatMetadata || {},
-    };
-    lines.push(JSON.stringify(meta));
-    for (const m of chat) {
+        chat_metadata: meta.chat_metadata || {},
+    }));
+    for (const m of chatArr || []) {
         if (!m || typeof m !== 'object') continue;
         lines.push(JSON.stringify({
             name: m.name,
@@ -193,58 +260,169 @@ function buildChatJsonl(c) {
     return lines.join('\n') + '\n';
 }
 
+async function pushChatPayload({ clientKey, title, jsonl }) {
+    const hash = await sha256Hex(jsonl);
+    const prev = mapGet(clientKey);
+    if (prev?.content_hash === hash && prev.cloud_id) {
+        return { skipped: true, reason: 'unchanged', id: prev.cloud_id };
+    }
+
+    const { bytes, gzipped } = await maybeGzip(jsonl);
+    const fd = new FormData();
+    const safeName = String(title || clientKey).replace(/[^\w.\-]+/g, '_').slice(0, 80) || 'chat';
+    const fname = gzipped ? `${safeName}.jsonl.gz` : `${safeName}.jsonl`;
+    // Server currently expects text jsonl — send uncompressed content always as application/jsonl
+    // (gzip field reserved: if backend adds support we can switch). Prefer raw for compatibility.
+    const uploadBlob = gzipped
+        ? new Blob([jsonl], { type: 'application/jsonl' }) // keep text until API supports gunzip
+        : new Blob([bytes], { type: 'application/jsonl' });
+    fd.append('file', uploadBlob, `${safeName}.jsonl`);
+    fd.append('client_key', clientKey);
+    fd.append('content_hash', hash);
+    fd.append('title', title || safeName);
+    if (gzipped) fd.append('gzip_ready', '1'); // hint for future server support
+
+    const res = await apiFetch('/api/v2/chats/import', { method: 'POST', formData: fd });
+    const id = res?.chat_id;
+    if (id) await mapSet(clientKey, id, hash);
+    return res;
+}
+
 async function pushCurrentChat() {
     const c = ctx();
     if (!c?.chat?.length) return { skipped: true, reason: 'empty chat' };
 
     const char = c.characters?.[c.characterId];
     const avatar = char?.avatar || 'unknown';
-    // Prefer real file name if available on metadata
-    const fileHint = c.getCurrentChatId?.() || c.chatId || currentChatFileName(c);
+    const fileHint = (typeof c.getCurrentChatId === 'function' && c.getCurrentChatId())
+        || c.chatId
+        || c.chatMetadata?.file_name
+        || 'chat';
     const clientKey = `chat:${avatar}:${fileHint}`;
-    const jsonl = buildChatJsonl(c);
-    const hash = await sha256Hex(jsonl);
+    const jsonl = buildChatJsonlFromArray(c.chat, {
+        user_name: c.name1,
+        character_name: c.name2 || char?.name,
+        chat_metadata: c.chatMetadata || {},
+    });
+    return pushChatPayload({
+        clientKey,
+        title: `${char?.name || avatar} · ${fileHint}`,
+        jsonl,
+    });
+}
 
-    const prev = mapGet(clientKey);
-    if (prev?.content_hash === hash && prev.cloud_id) {
-        return { skipped: true, reason: 'unchanged', id: prev.cloud_id };
+/**
+ * Best-effort: list chat files for current character via ST API.
+ * Falls back to current chat only.
+ */
+async function pushAllChatsForCurrentCharacter() {
+    const c = ctx();
+    const char = c.characters?.[c.characterId];
+    if (!char) return { pushed: 0, skipped: 0, errors: 0 };
+
+    let files = [];
+    try {
+        // Official ST endpoint used by Manage chat files
+        const res = await fetch('/api/characters/chats', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ avatar_url: char.avatar }),
+        });
+        if (res.ok) {
+            const data = await res.json();
+            files = Array.isArray(data) ? data : (data.chats || data.file_list || []);
+        }
+    } catch (e) {
+        logLine(`list chats: ${e.message}`);
     }
 
-    const blob = new Blob([jsonl], { type: 'application/jsonl' });
-    const fd = new FormData();
-    const safeName = String(fileHint).replace(/[^\w.\-]+/g, '_').slice(0, 80) || 'chat';
-    fd.append('file', blob, `${safeName}.jsonl`);
-    fd.append('client_key', clientKey);
-    fd.append('content_hash', hash);
-    fd.append('title', `${char?.name || avatar} · ${safeName}`);
+    // Normalize to list of { file_name }
+    files = files.map(f => {
+        if (typeof f === 'string') return { file_name: f };
+        return { file_name: f.file_name || f.filename || f.name || f };
+    }).filter(f => f.file_name);
 
-    const res = await apiFetch('/api/v2/chats/import', { method: 'POST', formData: fd });
-    const id = res?.chat_id;
-    if (id) mapSet(clientKey, id, hash);
-    return res;
+    if (!files.length) {
+        const r = await pushCurrentChat();
+        return {
+            pushed: r?.skipped ? 0 : 1,
+            skipped: r?.skipped ? 1 : 0,
+            errors: 0,
+        };
+    }
+
+    let pushed = 0, skipped = 0, errors = 0;
+    for (const f of files) {
+        try {
+            setStatus(`Чат: ${f.file_name}…`, 'busy');
+            const getRes = await fetch('/api/characters/get', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    avatar_url: char.avatar,
+                    file_name: f.file_name,
+                }),
+            });
+            // Some ST builds use /api/chats/get
+            let chatArr = null;
+            if (getRes.ok) {
+                chatArr = await getRes.json();
+            } else {
+                const alt = await fetch('/api/chats/get', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        avatar_url: char.avatar,
+                        file_name: String(f.file_name).replace(/\.jsonl$/i, ''),
+                    }),
+                });
+                if (alt.ok) chatArr = await alt.json();
+            }
+            if (!Array.isArray(chatArr) || !chatArr.length) {
+                skipped++;
+                continue;
+            }
+            // ST sometimes returns [meta, ...messages]
+            const messages = chatArr;
+            const clientKey = `chat:${char.avatar}:${f.file_name}`;
+            const jsonl = buildChatJsonlFromArray(messages, {
+                character_name: char.name,
+            });
+            const r = await pushChatPayload({
+                clientKey,
+                title: `${char.name} · ${f.file_name}`,
+                jsonl,
+            });
+            if (r?.skipped) skipped++;
+            else pushed++;
+        } catch (e) {
+            errors++;
+            logLine(`chat ${f.file_name}: ${e.message}`);
+        }
+    }
+    return { pushed, skipped, errors };
 }
 
 // ─── Personas ─────────────────────────────────────────────────────────────
 
 async function pushPersonas() {
     const c = ctx();
-    // power_user.personas is the usual store
-    const personas = c.powerUser?.personas || c.power_user?.personas || {};
-    const descriptions = c.powerUser?.persona_descriptions || c.power_user?.persona_descriptions || {};
-    const names = Object.keys(personas);
+    const power = c.powerUser || c.power_user || {};
+    const personas = power.personas || {};
+    const descriptions = power.persona_descriptions || {};
     let n = 0, skipped = 0;
-    for (const name of names) {
+
+    for (const name of Object.keys(personas)) {
         const descObj = descriptions[name] || {};
-        const description = typeof descObj === 'string' ? descObj : (descObj.description || descObj.prompt || '');
+        const description = typeof descObj === 'string'
+            ? descObj
+            : (descObj.description || descObj.prompt || '');
         const clientKey = `persona:${name}`;
-        const payload = JSON.stringify({ name, description });
-        const hash = await sha256Hex(payload);
-        const prev = mapGet(clientKey);
-        if (prev?.content_hash === hash) {
+        const hash = await sha256Hex(JSON.stringify({ name, description }));
+        if (mapGet(clientKey)?.content_hash === hash) {
             skipped++;
             continue;
         }
-        // Reuse persona import: send a minimal card-like JSON
         const card = {
             name,
             description,
@@ -266,8 +444,9 @@ async function pushPersonas() {
         try {
             const res = await apiFetch('/api/v2/personas/import', { method: 'POST', formData: fd });
             const id = res?.persona?.id || res?.id;
-            if (id) mapSet(clientKey, id, hash);
-            n++;
+            if (id) await mapSet(clientKey, id, hash);
+            if (res?.skipped) skipped++;
+            else n++;
         } catch (e) {
             logLine(`persona ${name}: ${e.message}`);
         }
@@ -279,37 +458,47 @@ async function pushPersonas() {
 
 async function pushLorebooks() {
     const c = ctx();
-    const wi = c.worldInfo || c.world_info;
-    // ST world_names + world_info
-    const names = c.worldInfoSettings?.world_names
-        || c.world_names
-        || (typeof world_names !== 'undefined' ? world_names : [])
-        || [];
-    // Fallback: only currently selected
-    const list = Array.isArray(names) && names.length ? names : [];
-    let n = 0, skipped = 0;
+    let names = [];
+    try {
+        names = c.worldInfoSettings?.world_names
+            || c.world_names
+            || (typeof world_names !== 'undefined' ? world_names : [])
+            || [];
+    } catch (_) { /* ignore */ }
 
-    // Prefer exporting via ST if available
-    for (const name of list) {
+    if (!Array.isArray(names) || !names.length) {
+        // Try selected world
+        const selected = c.worldInfoSettings?.world_info?.globalSelect
+            || c.selected_world
+            || null;
+        if (selected) names = Array.isArray(selected) ? selected : [selected];
+    }
+
+    let n = 0, skipped = 0;
+    for (const name of names) {
+        if (!name) continue;
         try {
-            const clientKey = `lorebook:${name}`;
-            // Attempt to load book data from context worldInfoData if matches
             let book = null;
-            if (c.worldInfoData && (c.worldInfoData.name === name || !list.length)) {
-                book = c.worldInfoData;
-            }
-            // If no structured data, skip silently (full export needs ST internal API)
-            if (!book && typeof c.loadWorldInfo === 'function') {
+            if (typeof c.loadWorldInfo === 'function') {
                 book = await c.loadWorldInfo(name);
+            }
+            if (!book) {
+                // ST server API
+                const res = await fetch('/api/worldinfo/get', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name }),
+                });
+                if (res.ok) book = await res.json();
             }
             if (!book) {
                 skipped++;
                 continue;
             }
             const payload = JSON.stringify(book);
+            const clientKey = `lorebook:${name}`;
             const hash = await sha256Hex(payload);
-            const prev = mapGet(clientKey);
-            if (prev?.content_hash === hash) {
+            if (mapGet(clientKey)?.content_hash === hash) {
                 skipped++;
                 continue;
             }
@@ -320,8 +509,9 @@ async function pushLorebooks() {
             fd.append('content_hash', hash);
             const res = await apiFetch('/api/v2/lorebooks/import', { method: 'POST', formData: fd });
             const id = res?.id;
-            if (id) mapSet(clientKey, id, hash);
-            n++;
+            if (id) await mapSet(clientKey, id, hash);
+            if (res?.skipped) skipped++;
+            else n++;
         } catch (e) {
             logLine(`lorebook ${name}: ${e.message}`);
         }
@@ -337,59 +527,232 @@ async function pushPresets() {
     try {
         const pm = c.getPresetManager?.();
         if (!pm) return { pushed: 0, skipped: 0, reason: 'no preset manager' };
-        const name = pm.getSelectedPresetName?.() || pm.getAllPresets?.()?.[0];
-        if (!name) return { pushed: 0, skipped: 0 };
-        const data = pm.getPresetSettings?.(name) || pm.getCompletionPresetByName?.(name);
-        if (!data) return { pushed: 0, skipped: 0 };
-        const payloadObj = typeof data === 'object' ? { ...data, name: data.name || name } : { name, raw: data };
-        const payload = JSON.stringify(payloadObj);
-        const clientKey = `preset:${name}`;
-        const hash = await sha256Hex(payload);
-        const prev = mapGet(clientKey);
-        if (prev?.content_hash === hash) return { pushed: 0, skipped: 1 };
-        await apiFetch('/api/v2/presets/import', { method: 'POST', body: payloadObj });
-        // presets import has no client_key yet — still count as pushed
-        mapSet(clientKey, 0, hash);
-        n = 1;
+
+        let names = [];
+        if (typeof pm.getAllPresets === 'function') {
+            names = pm.getAllPresets() || [];
+        }
+        const current = pm.getSelectedPresetName?.();
+        if (current && !names.includes(current)) names.push(current);
+        if (!names.length && current) names = [current];
+
+        for (const name of names) {
+            if (!name || name === 'Default') continue;
+            const data = pm.getPresetSettings?.(name)
+                || pm.getCompletionPresetByName?.(name)
+                || null;
+            if (!data || typeof data !== 'object') continue;
+
+            const payloadObj = { ...data, name: data.name || name };
+            const payload = JSON.stringify(payloadObj);
+            const clientKey = `preset:${name}`;
+            const hash = await sha256Hex(payload);
+            if (mapGet(clientKey)?.content_hash === hash) {
+                skipped++;
+                continue;
+            }
+            const q = new URLSearchParams({ client_key: clientKey, content_hash: hash });
+            const res = await apiFetch(`/api/v2/presets/import?${q}`, {
+                method: 'POST',
+                body: payloadObj,
+            });
+            const id = res?.preset?.id || res?.id;
+            if (id) await mapSet(clientKey, id, hash);
+            if (res?.skipped) skipped++;
+            else n++;
+        }
     } catch (e) {
         logLine(`preset: ${e.message}`);
     }
     return { pushed: n, skipped };
 }
 
+// ─── Pull (download into ST) ──────────────────────────────────────────────
+
+async function importCharacterCardFromCloud(char) {
+    // Export cloud character as JSON → ST import API
+    const card = {
+        name: char.name,
+        description: char.description || '',
+        personality: char.personality || '',
+        scenario: char.scenario || '',
+        first_mes: char.first_message || '',
+        mes_example: char.mes_example || '',
+        creatorcomment: char.creator_notes || '',
+        system_prompt: char.system_prompt || '',
+        post_history_instructions: char.post_history_instructions || '',
+        tags: char.tags || [],
+        creator_notes: char.creator_notes || '',
+        alternate_greetings: char.alternate_greetings || [],
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        data: {
+            name: char.name,
+            description: char.description || '',
+            personality: char.personality || '',
+            scenario: char.scenario || '',
+            first_mes: char.first_message || '',
+            mes_example: char.mes_example || '',
+            creator_notes: char.creator_notes || '',
+            system_prompt: char.system_prompt || '',
+            post_history_instructions: char.post_history_instructions || '',
+            tags: char.tags || [],
+            alternate_greetings: char.alternate_greetings || [],
+        },
+    };
+    const blob = new Blob([JSON.stringify(card)], { type: 'application/json' });
+    const fd = new FormData();
+    fd.append('avatar', blob, `${(char.name || 'card').replace(/[^\w\-]+/g, '_')}.json`);
+    // ST import character endpoint
+    const res = await fetch('/api/characters/import', { method: 'POST', body: fd });
+    if (!res.ok) {
+        // alternate: /api/character/import
+        const res2 = await fetch('/api/character/import', { method: 'POST', body: fd });
+        if (!res2.ok) throw new Error(`ST import failed ${res.status}/${res2.status}`);
+        return res2.json().catch(() => ({}));
+    }
+    return res.json().catch(() => ({}));
+}
+
+async function syncPull({ importCharacters = true } = {}) {
+    setStatus('Pull: загрузка списков…', 'busy');
+    await loadMap();
+    try {
+        const [chars, chats, personas, lore, presets, quotas] = await Promise.all([
+            apiFetch('/api/v2/characters').catch(() => ({ characters: [] })),
+            apiFetch('/api/v2/chats').catch(() => ({ chats: [] })),
+            apiFetch('/api/v2/personas').catch(() => ({ personas: [] })),
+            apiFetch('/api/v2/lorebooks').catch(() => ({ lorebooks: [] })),
+            apiFetch('/api/v2/presets').catch(() => ({ presets: [] })),
+            apiFetch('/api/v2/user/quotas').catch(() => null),
+        ]);
+
+        const cloudChars = (chars.characters || []).filter(c => c.creator_id); // user-owned
+        const summary = [
+            `cloud: chars ${cloudChars.length}`,
+            `chats ${(chats.chats || []).length}`,
+            `personas ${(personas.personas || []).length}`,
+            `lore ${(lore.lorebooks || []).length}`,
+            `presets ${(presets.presets || []).length}`,
+        ].join(' · ');
+        logLine(summary);
+        if (quotas?.usage) {
+            logLine(`quota chats ${quotas.usage.chats || 0}/${quotas.limits?.chats ?? '∞'}`);
+        }
+
+        let imported = 0, failed = 0;
+        if (importCharacters && cloudChars.length) {
+            // Only import characters not already mapped / present by name
+            const c = ctx();
+            const existingNames = new Set((c.characters || []).map(x => (x.name || '').toLowerCase()));
+            for (const ch of cloudChars) {
+                if (existingNames.has((ch.name || '').toLowerCase())) {
+                    logLine(`skip char (exists): ${ch.name}`);
+                    continue;
+                }
+                try {
+                    setStatus(`Импорт: ${ch.name}…`, 'busy');
+                    await importCharacterCardFromCloud(ch);
+                    imported++;
+                    logLine(`imported char: ${ch.name}`);
+                } catch (e) {
+                    failed++;
+                    logLine(`import ${ch.name}: ${e.message}`);
+                }
+            }
+            // Refresh character list if ST exposes it
+            try {
+                if (typeof c.getCharacters === 'function') await c.getCharacters();
+                else if (typeof getCharacters === 'function') await getCharacters();
+            } catch (_) { /* ignore */ }
+        }
+
+        // Lorebooks: download export JSON and import via ST
+        if (getSettings().sync_lorebooks && (lore.lorebooks || []).length) {
+            for (const lb of lore.lorebooks) {
+                try {
+                    const full = await apiFetch(`/api/v2/lorebooks/export?id=${lb.id}`);
+                    const res = await fetch('/api/worldinfo/import', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(full),
+                    });
+                    if (res.ok) {
+                        imported++;
+                        logLine(`imported lore: ${lb.name}`);
+                    } else {
+                        // fallback download-only note
+                        logLine(`lore ${lb.name}: export ok, ST import HTTP ${res.status} — скачай вручную из Файлы ИИ`);
+                    }
+                } catch (e) {
+                    logLine(`lore pull ${lb.name}: ${e.message}`);
+                }
+            }
+        }
+
+        const msg = `${summary} · imported ${imported} · fail ${failed}`;
+        setStatus(msg, failed ? 'err' : 'ok');
+        toast(failed ? 'warning' : 'success', msg);
+        logLine('Чаты: pull в ST пока через Dashboard → Файлы ИИ → Экспорт (jsonl).');
+    } catch (e) {
+        setStatus(`Pull error: ${e.message}`, 'err');
+        toast('error', e.message);
+    }
+}
+
 // ─── Orchestration ────────────────────────────────────────────────────────
 
-async function syncPush({ onlyCurrentChat = false } = {}) {
+async function syncPush({ onlyCurrentChat = false, allChats = false } = {}) {
     if (pushInFlight) {
         setStatus('Уже идёт синхронизация…', 'busy');
         return;
     }
     pushInFlight = true;
+    await loadMap();
     setStatus('Синхронизация…', 'busy');
     const s = getSettings();
     const stats = { characters: 0, chats: 0, personas: 0, lorebooks: 0, presets: 0, skipped: 0, errors: 0 };
 
     try {
-        if (onlyCurrentChat || s.sync_chats) {
+        if (onlyCurrentChat) {
             try {
                 const r = await pushCurrentChat();
                 if (r?.skipped) stats.skipped++;
-                else if (r?.chat_id || r?.updated) stats.chats++;
-                logLine(r?.skipped ? `chat skip: ${r.reason || 'ok'}` : `chat → cloud #${r?.chat_id}`);
+                else stats.chats++;
+                logLine(r?.skipped ? `chat skip: ${r.reason || 'ok'}` : `chat → #${r?.chat_id}`);
             } catch (e) {
                 stats.errors++;
                 logLine(`chat error: ${e.message}`);
             }
-            if (onlyCurrentChat) {
-                setStatus(stats.errors ? 'Чат: ошибка (см. лог)' : 'Текущий чат синхронизирован', stats.errors ? 'err' : 'ok');
-                return;
+            const ok = !stats.errors;
+            setStatus(ok ? 'Текущий чат синхронизирован' : 'Ошибка чата (лог)', ok ? 'ok' : 'err');
+            if (ok) toast('success', 'Чат сохранён в облако');
+            return;
+        }
+
+        if (s.sync_chats) {
+            try {
+                if (allChats) {
+                    const r = await pushAllChatsForCurrentCharacter();
+                    stats.chats += r.pushed || 0;
+                    stats.skipped += r.skipped || 0;
+                    stats.errors += r.errors || 0;
+                    logLine(`chats batch: +${r.pushed} skip ${r.skipped} err ${r.errors}`);
+                } else {
+                    const r = await pushCurrentChat();
+                    if (r?.skipped) stats.skipped++;
+                    else stats.chats++;
+                    logLine(r?.skipped ? `chat skip: ${r.reason || 'ok'}` : `chat → #${r?.chat_id}`);
+                }
+            } catch (e) {
+                stats.errors++;
+                logLine(`chat: ${e.message}`);
             }
         }
 
         if (s.sync_characters) {
             const c = ctx();
-            const chars = c.characters || [];
-            for (const char of chars) {
+            for (const char of (c.characters || [])) {
                 try {
                     setStatus(`Персонаж: ${char.name || char.avatar}…`, 'busy');
                     const r = await pushCharacter(char);
@@ -437,40 +800,14 @@ async function syncPush({ onlyCurrentChat = false } = {}) {
 
         const summary = `Готово · char ${stats.characters} · chat ${stats.chats} · persona ${stats.personas} · lore ${stats.lorebooks} · preset ${stats.presets} · skip ${stats.skipped} · err ${stats.errors}`;
         setStatus(summary, stats.errors ? 'err' : 'ok');
+        toast(stats.errors ? 'warning' : 'success', summary);
         logLine(summary);
     } catch (e) {
         setStatus(`Ошибка: ${e.message}`, 'err');
+        toast('error', e.message);
         logLine(e.message);
     } finally {
         pushInFlight = false;
-    }
-}
-
-async function syncPull() {
-    setStatus('Загрузка списков…', 'busy');
-    try {
-        const [chars, chats, personas, lore, presets, quotas] = await Promise.all([
-            apiFetch('/api/v2/characters').catch(() => ({ characters: [] })),
-            apiFetch('/api/v2/chats').catch(() => ({ chats: [] })),
-            apiFetch('/api/v2/personas').catch(() => ({ personas: [] })),
-            apiFetch('/api/v2/lorebooks').catch(() => ({ lorebooks: [] })),
-            apiFetch('/api/v2/presets').catch(() => ({ presets: [] })),
-            apiFetch('/api/v2/user/quotas').catch(() => null),
-        ]);
-        const msg = [
-            `В облаке: chars ${(chars.characters || []).length}`,
-            `chats ${(chats.chats || []).length}`,
-            `personas ${(personas.personas || []).length}`,
-            `lore ${(lore.lorebooks || []).length}`,
-            `presets ${(presets.presets || []).length}`,
-        ].join(' · ');
-        setStatus(msg + ' · полный Pull в ST — в след. версии (см. Файлы ИИ)', 'ok');
-        logLine(msg);
-        if (quotas?.usage) {
-            logLine(`quota chats ${quotas.usage.chats || 0} / ${quotas.limits?.chats ?? '∞'}`);
-        }
-    } catch (e) {
-        setStatus(`Pull error: ${e.message}`, 'err');
     }
 }
 
@@ -551,6 +888,7 @@ function bindUi() {
     bindCheck('wucloud_sync_personas', 'sync_personas');
     bindCheck('wucloud_sync_lorebooks', 'sync_lorebooks');
     bindCheck('wucloud_sync_presets', 'sync_presets');
+    bindCheck('wucloud_use_gzip', 'use_gzip');
 
     const auto = $('wucloud_autosave');
     if (auto) {
@@ -562,13 +900,15 @@ function bindUi() {
         });
     }
 
-    $('wucloud_push_btn')?.addEventListener('click', () => syncPush());
+    $('wucloud_push_btn')?.addEventListener('click', () => syncPush({ allChats: false }));
+    $('wucloud_push_all_chats_btn')?.addEventListener('click', () => syncPush({ allChats: true }));
     $('wucloud_push_chat_btn')?.addEventListener('click', () => syncPush({ onlyCurrentChat: true }));
-    $('wucloud_pull_btn')?.addEventListener('click', () => syncPull());
+    $('wucloud_pull_btn')?.addEventListener('click', () => syncPull({ importCharacters: true }));
 }
 
 async function init() {
     getSettings();
+    await loadMap();
     try {
         let html = null;
         if (typeof renderExtensionTemplateAsync === 'function') {
@@ -581,11 +921,8 @@ async function init() {
         if (html) {
             const host = document.getElementById('extensions_settings2')
                 || document.getElementById('extensions_settings');
-            if (host) {
-                // Avoid double inject
-                if (!document.getElementById('wucloud-sync-panel')) {
-                    host.insertAdjacentHTML('beforeend', html);
-                }
+            if (host && !document.getElementById('wucloud-sync-panel')) {
+                host.insertAdjacentHTML('beforeend', html);
             }
         }
     } catch (e) {
@@ -595,11 +932,10 @@ async function init() {
     bindUi();
     bindEvents();
     setupIntervalAutosave();
-    setStatus('Готов · WuCloud Sync 1.1.0', 'ok');
-    console.log(LOG_PREFIX, 'loaded');
+    setStatus('Готов · WuCloud Sync 1.2.0', 'ok');
+    console.log(LOG_PREFIX, 'loaded v1.2.0');
 }
 
-// Boot when DOM ready
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => jQuery(init));
 } else {

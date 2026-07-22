@@ -35,12 +35,14 @@ git clone https://github.com/shastitko1970-netizen/wucloud-sync \
 | Feature | Status |
 |---------|--------|
 | Push character cards (PNG) | ✅ |
-| Push current / all chats as one cloud dialog (upsert) | ✅ |
+| Push current chat / all chats of character (upsert) | ✅ |
 | Skip unchanged (content hash + client_key) | ✅ |
-| Personas / lorebooks / presets (opt-in) | ✅ partial |
+| Personas / lorebooks / presets (opt-in upsert) | ✅ |
 | Autosave chat (debounce / interval) | ✅ |
-| Pull list from cloud | ✅ list only |
-| Full pull into ST files | ⏳ next |
+| Mapping in localforage (not settings bloat) | ✅ |
+| Pull: list + import missing characters into ST | ✅ |
+| Pull chats/lorebooks fully into ST files | partial (lore try; chats via Dashboard export) |
+| Server-side gzip body | ⏳ prepared on client |
 
 ## Settings
 
