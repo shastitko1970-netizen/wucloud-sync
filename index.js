@@ -1,5 +1,5 @@
 /**
- * WuCloud Sync — SillyTavern extension v0.7.1
+ * WuCloud Sync — SillyTavern extension v0.7.2
  * Cloud backup to WuProj: characters, chats (lossless gzip blobs), personas, lorebooks, presets.
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
  * Branch: main or wucloud
@@ -478,63 +478,108 @@ async function pushAllChatsForCurrentCharacter() {
     return { pushed, skipped, errors };
 }
 
+// ─── ST settings helpers ──────────────────────────────────────────────────
+
+/** Full ST settings (includes power_user). */
+async function fetchSTSettings() {
+    try {
+        const res = await fetch('/api/settings/get');
+        if (res.ok) return await res.json();
+    } catch (e) {
+        logLine(`settings/get: ${e.message}`);
+    }
+    return null;
+}
+
+async function getPowerUser() {
+    const c = ctx();
+    if (c.powerUser && typeof c.powerUser === 'object') return c.powerUser;
+    if (c.power_user && typeof c.power_user === 'object') return c.power_user;
+    // Live module (ST loads power-user.js)
+    try {
+        const mod = await import(/* webpackIgnore: true */ '/scripts/power-user.js');
+        if (mod?.power_user) return mod.power_user;
+    } catch (_) { /* ignore */ }
+    const settings = await fetchSTSettings();
+    return settings?.power_user || settings?.powerUser || {};
+}
+
 // ─── Personas ─────────────────────────────────────────────────────────────
 
 /**
  * Collect ST user personas.
- * ST stores them as power_user.personas (name→avatar) + persona_descriptions (avatar→{description}).
+ * ST: power_user.personas (name→avatar file) + persona_descriptions (avatar→{description}).
  */
 async function collectSTPersonas() {
     const c = ctx();
-    const power = c.powerUser || c.power_user || {};
+    const power = await getPowerUser();
     /** @type {Array<{name:string, description:string, avatar?:string}>} */
     const out = [];
+    const seen = new Set();
+
+    const add = (name, description, avatar) => {
+        const key = `${avatar || ''}|${name || ''}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        out.push({
+            name: String(name || avatar || 'Persona'),
+            description: String(description || ''),
+            avatar: avatar || undefined,
+        });
+    };
 
     const personasMap = power.personas || {};
-    const descriptions = power.persona_descriptions || {};
+    const descriptions = power.persona_descriptions || power.personaDescriptions || {};
 
-    // Shape A: { "Display Name": "avatar.png" }
+    logLine(`personas debug: keys=${Object.keys(personasMap).length} descs=${Object.keys(descriptions).length} has_default_desc=${!!power.persona_description}`);
+
+    // Shape A: { "Display Name": "User Avatars/xxx.png" }
     for (const [key, val] of Object.entries(personasMap)) {
-        if (typeof val === 'string' && (val.endsWith('.png') || val.endsWith('.jpg') || val.includes('.'))) {
+        if (typeof val === 'string' && /\.(png|jpe?g|webp|gif)$/i.test(val)) {
             const avatar = val;
             const descObj = descriptions[avatar] || descriptions[key] || {};
             const description = typeof descObj === 'string'
                 ? descObj
-                : (descObj.description || descObj.prompt || power.persona_description || '');
-            out.push({ name: key, description: String(description || ''), avatar });
+                : (descObj?.description || descObj?.prompt || power.persona_description || '');
+            add(key, description, avatar);
             continue;
         }
-        // Shape B: { "avatar.png": "description" }
         if (typeof val === 'string') {
-            out.push({ name: key, description: val, avatar: key });
+            add(key, val, key);
             continue;
         }
-        // Shape C: nested object
         if (val && typeof val === 'object') {
-            out.push({
-                name: val.name || key,
-                description: val.description || val.prompt || '',
-                avatar: val.avatar || key,
-            });
+            add(val.name || key, val.description || val.prompt || '', val.avatar || key);
         }
     }
 
-    // Also descriptions without personas map entry
     for (const [key, descObj] of Object.entries(descriptions)) {
         if (out.some(p => p.avatar === key || p.name === key)) continue;
         const description = typeof descObj === 'string'
             ? descObj
-            : (descObj.description || descObj.prompt || '');
-        if (!description) continue;
-        out.push({ name: key.replace(/\.(png|jpg|webp)$/i, ''), description: String(description), avatar: key });
+            : (descObj?.description || descObj?.prompt || '');
+        if (!description && !key) continue;
+        add(String(key).replace(/\.(png|jpe?g|webp|gif)$/i, ''), description, key);
     }
 
-    // Default single persona_description
+    // Default persona text only
     if (!out.length && power.persona_description) {
-        out.push({
-            name: power.user_name || c.name1 || 'User',
-            description: String(power.persona_description),
-        });
+        add(power.user_name || c.name1 || 'User', power.persona_description, power.user_avatar);
+    }
+
+    // Fallback: list avatar files from User Avatars API if any
+    if (!out.length) {
+        try {
+            const res = await fetch('/api/avatars/get', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+            if (res.ok) {
+                const list = await res.json();
+                const arr = Array.isArray(list) ? list : (list.avatars || []);
+                for (const f of arr.slice(0, 50)) {
+                    const name = typeof f === 'string' ? f : (f.name || f.filename);
+                    if (name) add(String(name).replace(/\.(png|jpe?g|webp)$/i, ''), '', name);
+                }
+            }
+        } catch (_) { /* ignore */ }
     }
 
     return out;
@@ -608,40 +653,90 @@ async function pushPersonas() {
 async function listSTWorldInfoNames() {
     const c = ctx();
     let names = [];
-    try {
-        names = c.worldInfoSettings?.world_names
-            || c.world_names
-            || (typeof world_names !== 'undefined' ? world_names : [])
-            || [];
-    } catch (_) { /* ignore */ }
-    if (!Array.isArray(names)) names = [];
 
-    // ST HTTP list
+    // 1) Context / globals
+    try {
+        const fromCtx = c.worldInfoSettings?.world_names
+            || c.world_names
+            || c.worldInfoNames
+            || (typeof world_names !== 'undefined' ? world_names : null);
+        if (Array.isArray(fromCtx)) names = fromCtx.slice();
+    } catch (_) { /* ignore */ }
+
+    // 2) Module import (most reliable on modern ST)
     if (!names.length) {
-        for (const url of ['/api/worldinfo/get', '/api/worldinfo/list']) {
+        try {
+            const mod = await import(/* webpackIgnore: true */ '/scripts/world-info.js');
+            if (Array.isArray(mod?.world_names)) names = mod.world_names.slice();
+            else if (typeof mod?.getWorldInfoSettings === 'function') {
+                const wi = mod.getWorldInfoSettings();
+                if (Array.isArray(wi?.world_names)) names = wi.world_names.slice();
+            }
+        } catch (e) {
+            logLine(`world-info module: ${e.message}`);
+        }
+    }
+
+    // 3) Settings blob
+    if (!names.length) {
+        const settings = await fetchSTSettings();
+        const cand = settings?.world_info?.world_names
+            || settings?.world_names
+            || settings?.power_user?.world_names;
+        if (Array.isArray(cand)) names = cand.slice();
+    }
+
+    // 4) HTTP endpoints used by various ST builds
+    if (!names.length) {
+        for (const [url, body] of [
+            ['/api/worldinfo/get', {}],
+            ['/api/worldinfo', {}],
+            ['/api/worldinfo/list', {}],
+            ['/api/files/list', { folder: 'worlds', path: 'worlds' }],
+            ['/api/data/list', { type: 'world' }],
+        ]) {
             try {
                 const res = await fetch(url, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({}),
+                    body: JSON.stringify(body),
                 });
                 if (!res.ok) continue;
                 const data = await res.json();
-                if (Array.isArray(data)) names = data.map(x => (typeof x === 'string' ? x : x.name)).filter(Boolean);
-                else if (Array.isArray(data?.list)) names = data.list;
-                else if (Array.isArray(data?.world_names)) names = data.world_names;
-                if (names.length) break;
+                let arr = null;
+                if (Array.isArray(data)) arr = data;
+                else if (Array.isArray(data?.list)) arr = data.list;
+                else if (Array.isArray(data?.world_names)) arr = data.world_names;
+                else if (Array.isArray(data?.files)) arr = data.files;
+                if (arr?.length) {
+                    names = arr.map(x => {
+                        if (typeof x === 'string') return x.replace(/\.json$/i, '');
+                        return x.name || x.filename || x.file_name || '';
+                    }).filter(Boolean);
+                    if (names.length) {
+                        logLine(`lore list via ${url}: ${names.length}`);
+                        break;
+                    }
+                }
             } catch (_) { /* next */ }
         }
     }
 
+    // 5) Currently selected books
     if (!names.length) {
         const selected = c.worldInfoSettings?.world_info?.globalSelect
             || c.selected_world
+            || c.worldInfoData?.name
             || null;
         if (selected) names = Array.isArray(selected) ? selected : [selected];
     }
-    return [...new Set(names.filter(Boolean))];
+
+    // 6) Open book in UI memory
+    if (!names.length && c.worldInfoData && (c.worldInfoData.entries || c.worldInfoData.name)) {
+        names = [c.worldInfoData.name || 'current_world'];
+    }
+
+    return [...new Set(names.filter(Boolean).map(n => String(n).replace(/\.json$/i, '')))];
 }
 
 async function loadSTWorldInfo(name) {
@@ -652,7 +747,21 @@ async function loadSTWorldInfo(name) {
             if (book) return book;
         } catch (_) { /* fallthrough */ }
     }
-    for (const body of [{ name }, { worldInfoName: name }, { file: name }]) {
+    try {
+        const mod = await import(/* webpackIgnore: true */ '/scripts/world-info.js');
+        if (typeof mod?.loadWorldInfo === 'function') {
+            const book = await mod.loadWorldInfo(name);
+            if (book) return book;
+        }
+    } catch (_) { /* ignore */ }
+
+    for (const body of [
+        { name },
+        { worldInfoName: name },
+        { file: name },
+        { file_name: name },
+        { filename: `${name}.json` },
+    ]) {
         try {
             const res = await fetch('/api/worldinfo/get', {
                 method: 'POST',
@@ -661,7 +770,9 @@ async function loadSTWorldInfo(name) {
             });
             if (res.ok) {
                 const book = await res.json();
-                if (book && (book.entries || book.name || Object.keys(book).length)) return book;
+                if (book && typeof book === 'object' && (book.entries || book.name || Object.keys(book).length > 2)) {
+                    return book;
+                }
             }
         } catch (_) { /* next */ }
     }
@@ -1325,8 +1436,8 @@ async function init() {
     bindUi();
     bindEvents();
     setupIntervalAutosave();
-    setStatus('Готов · WuCloud Sync 0.7.1', 'ok');
-    console.log(LOG_PREFIX, 'loaded v0.7.1');
+    setStatus('Готов · WuCloud Sync 0.7.2', 'ok');
+    console.log(LOG_PREFIX, 'loaded v0.7.2');
 }
 
 if (document.readyState === 'loading') {
