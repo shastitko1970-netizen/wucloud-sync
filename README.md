@@ -40,9 +40,11 @@ git clone https://github.com/shastitko1970-netizen/wucloud-sync \
 | Personas / lorebooks / presets (opt-in upsert) | ✅ |
 | Autosave chat (debounce / interval) | ✅ |
 | Mapping in localforage (not settings bloat) | ✅ |
-| Pull: list + import missing characters into ST | ✅ |
-| Pull chats/lorebooks fully into ST files | partial (lore try; chats via Dashboard export) |
-| Server-side gzip body | ⏳ prepared on client |
+| Pull: characters into ST | ✅ |
+| Pull: chat blobs (jsonl) into ST / download | ✅ v1.3 |
+| Pull: lorebooks + presets (import or download) | ✅ v1.3 |
+| Lossless chat blobs + gzip at rest | ✅ `/api/v2/st-sync/blobs` |
+| Cold archive idle blobs | ✅ `/api/v2/st-sync/archive` |
 
 ## Settings
 

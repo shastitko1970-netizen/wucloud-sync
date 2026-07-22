@@ -1,6 +1,6 @@
 /**
- * WuCloud Sync — SillyTavern extension v1.2.0
- * Cloud backup to WuProj: characters, chats, personas, lorebooks, presets.
+ * WuCloud Sync — SillyTavern extension v1.3.0
+ * Cloud backup to WuProj: characters, chats (lossless gzip blobs), personas, lorebooks, presets.
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
  */
 import { getContext, extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
@@ -268,23 +268,31 @@ async function pushChatPayload({ clientKey, title, jsonl }) {
     }
 
     const { bytes, gzipped } = await maybeGzip(jsonl);
-    const fd = new FormData();
     const safeName = String(title || clientKey).replace(/[^\w.\-]+/g, '_').slice(0, 80) || 'chat';
+    const fd = new FormData();
     const fname = gzipped ? `${safeName}.jsonl.gz` : `${safeName}.jsonl`;
-    // Server currently expects text jsonl — send uncompressed content always as application/jsonl
-    // (gzip field reserved: if backend adds support we can switch). Prefer raw for compatibility.
-    const uploadBlob = gzipped
-        ? new Blob([jsonl], { type: 'application/jsonl' }) // keep text until API supports gunzip
-        : new Blob([bytes], { type: 'application/jsonl' });
-    fd.append('file', uploadBlob, `${safeName}.jsonl`);
+    fd.append('file', new Blob([bytes], { type: gzipped ? 'application/gzip' : 'application/jsonl' }), fname);
     fd.append('client_key', clientKey);
+    fd.append('kind', 'chat_jsonl');
+    fd.append('name', title || safeName);
     fd.append('content_hash', hash);
-    fd.append('title', title || safeName);
-    if (gzipped) fd.append('gzip_ready', '1'); // hint for future server support
+    fd.append('meta', JSON.stringify({ source: 'wucloud-sync', gzipped: !!gzipped }));
 
-    const res = await apiFetch('/api/v2/chats/import', { method: 'POST', formData: fd });
-    const id = res?.chat_id;
+    // Lossless blob API (gzip at rest on server)
+    const res = await apiFetch('/api/v2/st-sync/blobs', { method: 'POST', formData: fd });
+    const id = res?.id;
     if (id) await mapSet(clientKey, id, hash);
+
+    // Best-effort dual-write to platform chats for Dashboard preview (lossy OK)
+    try {
+        const fd2 = new FormData();
+        fd2.append('file', new Blob([jsonl], { type: 'application/jsonl' }), `${safeName}.jsonl`);
+        fd2.append('client_key', `platform:${clientKey}`);
+        fd2.append('content_hash', hash);
+        fd2.append('title', title || safeName);
+        await apiFetch('/api/v2/chats/import', { method: 'POST', formData: fd2 });
+    } catch (_) { /* non-fatal */ }
+
     return res;
 }
 
@@ -614,86 +622,230 @@ async function importCharacterCardFromCloud(char) {
     return res.json().catch(() => ({}));
 }
 
-async function syncPull({ importCharacters = true } = {}) {
-    setStatus('Pull: загрузка списков…', 'busy');
-    await loadMap();
+async function fetchBlobText(id) {
+    const key = apiKey();
+    const res = await fetch(`${baseUrl()}/api/v2/st-sync/blobs/get?id=${id}`, {
+        headers: { Authorization: `Bearer ${key}` },
+    });
+    if (!res.ok) throw new Error(`blob get ${res.status}`);
+    return res.text();
+}
+
+/**
+ * Save a chat jsonl into ST for a character avatar.
+ * Tries common ST endpoints; falls back to browser download.
+ */
+async function importChatJsonlToST(charAvatar, fileName, jsonlText) {
+    const baseName = String(fileName).replace(/\.jsonl$/i, '');
+    // ST endpoint used by import chat from file
+    const attempts = [
+        { url: '/api/chats/import', body: () => {
+            const fd = new FormData();
+            fd.append('avatar_url', charAvatar);
+            fd.append('file', new Blob([jsonlText], { type: 'application/jsonl' }), `${baseName}.jsonl`);
+            return fd;
+        }},
+        { url: '/api/characters/import-chat', body: () => {
+            const fd = new FormData();
+            fd.append('avatar_url', charAvatar);
+            fd.append('file', new Blob([jsonlText], { type: 'application/jsonl' }), `${baseName}.jsonl`);
+            return fd;
+        }},
+    ];
+    for (const a of attempts) {
+        try {
+            const res = await fetch(a.url, { method: 'POST', body: a.body() });
+            if (res.ok) return { ok: true, via: a.url };
+        } catch (_) { /* try next */ }
+    }
+    // Fallback: trigger download for user to place manually
+    const blob = new Blob([jsonlText], { type: 'application/jsonl' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${baseName}.jsonl`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    return { ok: false, via: 'download' };
+}
+
+async function importLorebookToST(full) {
+    const name = full.name || full.Name || 'imported_lore';
+    const attempts = [
+        { url: '/api/worldinfo/import', json: true },
+        { url: '/api/worldinfo/upload', form: true },
+    ];
+    for (const a of attempts) {
+        try {
+            if (a.json) {
+                const res = await fetch(a.url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(full),
+                });
+                if (res.ok) return { ok: true, via: a.url };
+            } else {
+                const fd = new FormData();
+                fd.append('file', new Blob([JSON.stringify(full)], { type: 'application/json' }), `${name}.json`);
+                const res = await fetch(a.url, { method: 'POST', body: fd });
+                if (res.ok) return { ok: true, via: a.url };
+            }
+        } catch (_) { /* next */ }
+    }
+    return { ok: false };
+}
+
+async function importPresetToST(preset) {
+    const raw = preset.raw_data || preset;
+    const name = preset.name || raw.name || 'imported_preset';
+    // Chat completion presets live in settings — try ST API
     try {
-        const [chars, chats, personas, lore, presets, quotas] = await Promise.all([
+        const res = await fetch('/api/settings/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(raw),
+        });
+        if (res.ok) return { ok: true };
+    } catch (_) { /* ignore */ }
+    // Download fallback
+    const blob = new Blob([JSON.stringify(raw, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${String(name).replace(/[^\w\-]+/g, '_')}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    return { ok: false, via: 'download' };
+}
+
+async function syncPull({ importCharacters = true } = {}) {
+    setStatus('Pull: загрузка…', 'busy');
+    await loadMap();
+    const s = getSettings();
+    try {
+        const [chars, personas, lore, presets, blobs, quotas] = await Promise.all([
             apiFetch('/api/v2/characters').catch(() => ({ characters: [] })),
-            apiFetch('/api/v2/chats').catch(() => ({ chats: [] })),
             apiFetch('/api/v2/personas').catch(() => ({ personas: [] })),
             apiFetch('/api/v2/lorebooks').catch(() => ({ lorebooks: [] })),
             apiFetch('/api/v2/presets').catch(() => ({ presets: [] })),
+            apiFetch('/api/v2/st-sync/blobs?kind=chat_jsonl').catch(() => ({ items: [] })),
             apiFetch('/api/v2/user/quotas').catch(() => null),
         ]);
 
-        const cloudChars = (chars.characters || []).filter(c => c.creator_id); // user-owned
+        const cloudChars = (chars.characters || []).filter(c => c.creator_id);
+        const chatBlobs = blobs.items || [];
         const summary = [
-            `cloud: chars ${cloudChars.length}`,
-            `chats ${(chats.chats || []).length}`,
+            `chars ${cloudChars.length}`,
+            `chat-blobs ${chatBlobs.length}`,
             `personas ${(personas.personas || []).length}`,
             `lore ${(lore.lorebooks || []).length}`,
             `presets ${(presets.presets || []).length}`,
         ].join(' · ');
-        logLine(summary);
+        logLine(`cloud: ${summary}`);
         if (quotas?.usage) {
             logLine(`quota chats ${quotas.usage.chats || 0}/${quotas.limits?.chats ?? '∞'}`);
         }
 
-        let imported = 0, failed = 0;
-        if (importCharacters && cloudChars.length) {
-            // Only import characters not already mapped / present by name
-            const c = ctx();
+        let imported = 0, failed = 0, downloads = 0;
+        const c = ctx();
+
+        // Characters
+        if (importCharacters && s.sync_characters !== false && cloudChars.length) {
             const existingNames = new Set((c.characters || []).map(x => (x.name || '').toLowerCase()));
             for (const ch of cloudChars) {
-                if (existingNames.has((ch.name || '').toLowerCase())) {
-                    logLine(`skip char (exists): ${ch.name}`);
-                    continue;
-                }
+                if (existingNames.has((ch.name || '').toLowerCase())) continue;
                 try {
-                    setStatus(`Импорт: ${ch.name}…`, 'busy');
+                    setStatus(`Pull char: ${ch.name}…`, 'busy');
                     await importCharacterCardFromCloud(ch);
                     imported++;
-                    logLine(`imported char: ${ch.name}`);
                 } catch (e) {
                     failed++;
-                    logLine(`import ${ch.name}: ${e.message}`);
+                    logLine(`char ${ch.name}: ${e.message}`);
                 }
             }
-            // Refresh character list if ST exposes it
             try {
                 if (typeof c.getCharacters === 'function') await c.getCharacters();
                 else if (typeof getCharacters === 'function') await getCharacters();
             } catch (_) { /* ignore */ }
         }
 
-        // Lorebooks: download export JSON and import via ST
-        if (getSettings().sync_lorebooks && (lore.lorebooks || []).length) {
-            for (const lb of lore.lorebooks) {
-                try {
-                    const full = await apiFetch(`/api/v2/lorebooks/export?id=${lb.id}`);
-                    const res = await fetch('/api/worldinfo/import', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(full),
-                    });
-                    if (res.ok) {
-                        imported++;
-                        logLine(`imported lore: ${lb.name}`);
-                    } else {
-                        // fallback download-only note
-                        logLine(`lore ${lb.name}: export ok, ST import HTTP ${res.status} — скачай вручную из Файлы ИИ`);
+        // Chat blobs → ST (need a character selected)
+        if (s.sync_chats && chatBlobs.length) {
+            const char = c.characters?.[c.characterId];
+            const avatar = char?.avatar;
+            if (!avatar) {
+                logLine('chats pull: выбери персонажа в ST, затем Pull снова');
+            } else {
+                for (const item of chatBlobs) {
+                    try {
+                        setStatus(`Pull chat: ${item.name}…`, 'busy');
+                        const text = await fetchBlobText(item.id);
+                        // client_key often chat:avatar:filename
+                        let fileName = item.name || `chat_${item.id}`;
+                        const parts = String(item.client_key || '').split(':');
+                        if (parts.length >= 3) fileName = parts.slice(2).join(':');
+                        const r = await importChatJsonlToST(avatar, fileName, text);
+                        if (r.ok) imported++;
+                        else { downloads++; logLine(`chat ${fileName}: saved as download`); }
+                        await mapSet(item.client_key, item.id, item.content_hash);
+                    } catch (e) {
+                        failed++;
+                        logLine(`chat blob ${item.id}: ${e.message}`);
                     }
-                } catch (e) {
-                    logLine(`lore pull ${lb.name}: ${e.message}`);
                 }
             }
         }
 
-        const msg = `${summary} · imported ${imported} · fail ${failed}`;
+        // Lorebooks
+        if (s.sync_lorebooks && (lore.lorebooks || []).length) {
+            for (const lb of lore.lorebooks) {
+                try {
+                    setStatus(`Pull lore: ${lb.name}…`, 'busy');
+                    const full = await apiFetch(`/api/v2/lorebooks/export?id=${lb.id}`);
+                    const r = await importLorebookToST(full);
+                    if (r.ok) imported++;
+                    else {
+                        downloads++;
+                        const blob = new Blob([JSON.stringify(full, null, 2)], { type: 'application/json' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `${(lb.name || 'lore').replace(/[^\w\-]+/g, '_')}.json`;
+                        document.body.appendChild(a);
+                        a.click();
+                        a.remove();
+                        URL.revokeObjectURL(url);
+                    }
+                } catch (e) {
+                    failed++;
+                    logLine(`lore ${lb.name}: ${e.message}`);
+                }
+            }
+        }
+
+        // Presets
+        if (s.sync_presets && (presets.presets || []).length) {
+            for (const pr of presets.presets) {
+                try {
+                    setStatus(`Pull preset: ${pr.name}…`, 'busy');
+                    const full = await apiFetch(`/api/v2/presets/export?id=${pr.id}`).catch(() => pr);
+                    const r = await importPresetToST(full);
+                    if (r.ok) imported++;
+                    else downloads++;
+                } catch (e) {
+                    failed++;
+                    logLine(`preset ${pr.name}: ${e.message}`);
+                }
+            }
+        }
+
+        const msg = `${summary} · in-ST ${imported} · download ${downloads} · fail ${failed}`;
         setStatus(msg, failed ? 'err' : 'ok');
         toast(failed ? 'warning' : 'success', msg);
-        logLine('Чаты: pull в ST пока через Dashboard → Файлы ИИ → Экспорт (jsonl).');
     } catch (e) {
         setStatus(`Pull error: ${e.message}`, 'err');
         toast('error', e.message);
@@ -932,8 +1084,8 @@ async function init() {
     bindUi();
     bindEvents();
     setupIntervalAutosave();
-    setStatus('Готов · WuCloud Sync 1.2.0', 'ok');
-    console.log(LOG_PREFIX, 'loaded v1.2.0');
+    setStatus('Готов · WuCloud Sync 1.3.0', 'ok');
+    console.log(LOG_PREFIX, 'loaded v1.3.0');
 }
 
 if (document.readyState === 'loading') {
