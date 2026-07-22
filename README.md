@@ -15,7 +15,9 @@
 https://github.com/shastitko1970-netizen/wucloud-sync
 ```
 
-4. Confirm install (all users / current user)
+4. **Branch field:** leave empty, or use `main`, or `wucloud` (same code).  
+   Do **not** invent other branch names — ST will fail with `Remote branch … not found`.
+5. Confirm install (all users / current user)
 5. Enable **WuCloud Sync** if needed
 6. Open the extension drawer → paste your **`wu-…` API key** from [WuProj dashboard](https://wuproj.com/dashboard)
 
