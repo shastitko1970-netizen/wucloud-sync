@@ -1,80 +1,238 @@
 # WuCloud Sync
 
-**Version:** 0.7.0  
+**Версия:** 0.7.5  
+**Расширение для [SillyTavern](https://docs.sillytavern.app/)** — облачный бэкап и синхронизация с [WuProj](https://wuproj.com).
 
-**SillyTavern extension** — cloud backup of characters, chats, personas, lorebooks and generation presets to [WuProj](https://wuproj.com) («Файлы ИИ»).
+Репозиторий содержит **только** мод (без бэкенда). Устанавливается в ST одной ссылкой.
 
-> This repository contains **only** the SillyTavern extension (installable by Git URL).  
-> Backend and dashboard live in the WuApi product — not in this repo.
+---
 
-## Install in SillyTavern
+## Зачем это нужно
 
-1. Open **Extensions**
-2. **Install extension**
-3. Paste:
+SillyTavern хранит всё **локально** на вашем ПК: персонажи, чаты, лорбуки, personas, пресеты. Если диск умер, переустановили систему или сели за другой компьютер — данные легко потерять.
+
+**WuCloud Sync** копирует выбранные данные в облако WuProj:
+
+| Проблема | Как помогает |
+|----------|----------------|
+| «Потерял персонажей / чаты» | Есть бэкап в облаке, можно скачать обратно |
+| Несколько ПК / VPS | Push с одного → Pull на другом |
+| Долгий ролеплей | Автосохранение чата без ручного экспорта |
+| Дубликаты при каждом бэкапе | Повторный Push **обновляет** тот же объект, а не плодит копии |
+
+Управление файлами в браузере: [Dashboard → Файлы ИИ](https://wuproj.com/dashboard?tab=files).
+
+---
+
+## Что синхронизируется
+
+Включите галочки в панели расширения:
+
+| Тип | Что именно |
+|-----|------------|
+| **Персонажи** | Карточки (PNG / данные персонажа) |
+| **Диалоги** | Чаты (jsonl, без потерь; gzip) |
+| **Personas** | Профили пользователя |
+| **Лорбуки** | World Info |
+| **Пресеты** | Пресеты генерации |
+| **Gzip** | Сжатие при отправке (обычно оставьте включённым) |
+
+Повторная отправка **того же** персонажа/чата **не создаёт дубликат**: используется стабильный ключ (`client_key`) и хэш содержимого. Неизменённые объекты пропускаются.
+
+---
+
+## Установка (рекомендуется)
+
+На машине с SillyTavern должен быть установлен **git**.
+
+1. Откройте SillyTavern → **Extensions** (Расширения).
+2. **Install extension** (Установить расширение).
+3. Вставьте URL:
 
 ```text
 https://github.com/shastitko1970-netizen/wucloud-sync
 ```
 
-4. **Branch field:** leave empty, or use `main`, or `wucloud` (same code).  
-   Do **not** invent other branch names — ST will fail with `Remote branch … not found`.
-5. Confirm install (all users / current user)
-6. Enable **WuCloud Sync** if needed
-7. Open the extension drawer → paste your **`wu-…` API key** from [WuProj dashboard → API keys](https://wuproj.com/dashboard)
-8. Click **«Проверить ключ»** before Push
+4. Поле **branch**:
+   - оставьте **пустым**, или
+   - укажите `main` или `wucloud`  
+   **Не** придумывайте другие имена веток — установка упадёт с `Remote branch … not found`.
+5. Подтвердите установку (для всех пользователей / только для текущего).
+6. Убедитесь, что **WuCloud Sync** включён.
+7. Перезагрузите страницу ST, если панель не появилась.
 
-### Auth notes
-
-- Key **must** start with `wu-` (API key from the dashboard).
-- Not a password, not a JWT, not a Telegram session.
-- If you see `401 Invalid API key` — recreate the key and paste again (no spaces/quotes).
-
-Requires **git** on the machine running SillyTavern.
-
-### Manual install
+### Установка вручную (если нет кнопки Install)
 
 ```bash
 git clone https://github.com/shastitko1970-netizen/wucloud-sync \
   "public/scripts/extensions/third-party/wucloud-sync"
 ```
 
-(or into `data/<user>/extensions/wucloud-sync` for single-user installs)
+Для single-user установки путь может быть:
 
-## Features
+```text
+data/<user>/extensions/wucloud-sync
+```
 
-| Feature | Status |
-|---------|--------|
-| Push character cards (PNG) | ✅ |
-| Push current chat / all chats of character (upsert) | ✅ |
-| Skip unchanged (content hash + client_key) | ✅ |
-| Personas / lorebooks / presets (opt-in upsert) | ✅ |
-| Autosave chat (debounce / interval) | ✅ |
-| Mapping in localforage (not settings bloat) | ✅ |
-| Pull: characters into ST | ✅ |
-| Pull: chat blobs (jsonl) into ST / download | ✅ v1.3 |
-| Pull: lorebooks + presets (import or download) | ✅ v1.3 |
-| Lossless chat blobs + gzip at rest | ✅ `/api/v2/st-sync/blobs` |
-| Cold archive idle blobs | ✅ `/api/v2/st-sync/archive` |
+После клона перезапустите SillyTavern.
 
-## Settings
+### Обновление
 
-- **API key** — `wu-…` from the dashboard  
-- **Base URL** — default `https://api.wuproj.com`  
-- **What to sync** — characters, chats, personas, lorebooks, presets  
-- **Autosave** — off / after message / interval  
+В ST: **Manage extensions** → обновить **WuCloud Sync** (или `git pull` в папке расширения).
 
-Manage cloud files in the browser: **Dashboard → Файлы ИИ**.
+---
 
-## Privacy
+## Первый запуск (5 минут)
 
-The API key is stored in SillyTavern extension settings (local plaintext, like most ST extensions). Use a dedicated key you can revoke.
+### 1. API-ключ WuProj
 
-## License
+1. Зайдите на [wuproj.com](https://wuproj.com) → войдите в аккаунт.
+2. **Dashboard → API keys** (ключи API).
+3. Создайте ключ и скопируйте его. Он выглядит так: **`wu-…`**.
 
-MIT — see [LICENSE](./LICENSE).
+> Это **не** пароль от сайта, **не** JWT и **не** токен Telegram.  
+> Нужен именно API-ключ вида `wu-…`.
 
-## Links
+### 2. Настройка в SillyTavern
 
-- Dashboard: https://wuproj.com/dashboard  
-- Issues: https://github.com/shastitko1970-netizen/wucloud-sync/issues  
+1. Откройте панель расширений → drawer **WuCloud Sync**.
+2. Вставьте ключ в поле **API-ключ (wu-…)**.
+3. **API base URL** по умолчанию: `https://api.wuproj.com` (обычно не трогайте).
+4. Нажмите **«Проверить ключ»** — должно быть OK.
+5. Отметьте, **что** синхронизировать.
+6. Нажмите **Push** — первый бэкап.
+
+Готово. Файлы появятся в [Dashboard → Файлы ИИ](https://wuproj.com/dashboard?tab=files).
+
+---
+
+## Кнопки и режимы
+
+### Основные действия
+
+| Кнопка | Что делает |
+|--------|------------|
+| **Проверить ключ** | Проверяет API-ключ и доступ к серверу |
+| **Push** | Отправляет в облако всё, что отмечено галочками (персонажи, personas, лорбуки, пресеты + по настройкам чаты) |
+| **Текущий чат** | Бэкап только открытого диалога |
+| **Все чаты персонажа** | Все чаты **текущего** выбранного персонажа |
+| **Pull** | Скачивает из облака в ST (персонажи, чаты, лорбуки и т.д.) |
+
+### Автосохранение диалогов
+
+| Режим | Поведение |
+|-------|-----------|
+| **Выкл** | Только ручной Push / «Текущий чат» |
+| **После сообщения** | Через N секунд после сообщения (debounce) — один объект в облаке обновляется |
+| **По таймеру** | Периодический бэкап текущего чата |
+
+**Debounce / интервал (сек)** — пауза перед сохранением (по умолчанию 8). Не ставьте слишком мало: лишняя нагрузка на сеть.
+
+Автосейв пишет **один** облачный диалог на чат (overwrite), а не новый файл каждый раз.
+
+### Журнал
+
+Блок **«Журнал WuCloud»** в панели — логи мода.
+
+- Они **не** попадают в Server log SillyTavern.
+- Дополнительно: **F12 → Console**, строки с `[WuCloud]`.
+- **Copy** / **Clear** / **Full** — скопировать, очистить, открыть большим окном.
+
+---
+
+## Типичные сценарии
+
+### «Хочу просто бэкап на всякий случай»
+
+1. Ключ → **Проверить ключ**.
+2. Все галочки включены.
+3. Раз в день (или после важной сессии) — **Push**.
+4. Чаты: **Все чаты персонажа** или включить автосейв.
+
+### «Переезжаю на другой ПК / VPS»
+
+1. На старом: **Push** (+ «Все чаты» по нужным персонажам).
+2. На новом: установите мод, вставьте **тот же** ключ.
+3. **Pull**.  
+   Для чатов иногда нужно **сначала выбрать персонажа** в ST, затем снова Pull.
+
+### «Боюсь потерять длинный диалог»
+
+- Режим автосейва **«После сообщения»**.
+- Либо периодически **«Текущий чат»**.
+
+### «Посмотреть / удалить облачные файлы»
+
+Браузер: [Dashboard → Файлы ИИ](https://wuproj.com/dashboard?tab=files) — список, квоты, удаление.
+
+---
+
+## Как это устроено (кратко)
+
+```text
+SillyTavern (локально)
+        │  Push / autosave
+        ▼
+   api.wuproj.com  (ключ wu-…)
+        │
+        ▼
+  Облако WuProj  →  Dashboard «Файлы ИИ»
+        │  Pull
+        ▼
+SillyTavern (этот или другой ПК)
+```
+
+- Повторный Push **обновляет** запись (upsert), если содержимое изменилось.
+- Если хэш не изменился — отправка **пропускается** (экономия трафика и места).
+- Чаты уходят как lossless blob (часто с gzip).
+
+---
+
+## Требования
+
+| | |
+|--|--|
+| SillyTavern | ≥ 1.12.0 (см. `manifest.json`) |
+| git | Нужен для установки по URL |
+| Аккаунт WuProj | [wuproj.com](https://wuproj.com) |
+| API-ключ | Формат `wu-…` из Dashboard |
+
+---
+
+## Частые проблемы
+
+| Симптом | Что проверить |
+|---------|----------------|
+| `Remote branch … not found` | Branch пустой, `main` или `wucloud` — не выдуманное имя |
+| `401` / Invalid API key | Ключ именно `wu-…`, без пробелов и кавычек; пересоздайте ключ в Dashboard |
+| Панель не видна | Мод включён; обновите страницу ST; проверьте Manage extensions |
+| Push «молчит» / ничего не ушло | Галочки «Что синхронизировать»; журнал в панели; F12 → Console |
+| Pull чатов пустой / ошибка | Сначала выберите персонажа в ST, затем Pull снова |
+| git clone failed | Установите git на машине, где крутится ST; проверьте сеть/прокси |
+| 401 после смены ключа | Вставьте новый ключ → **Проверить ключ** → снова Push |
+
+---
+
+## Конфиденциальность
+
+- API-ключ хранится в настройках расширения SillyTavern **локально** (как у большинства ST-расширений — открытый текст на диске).
+- Рекомендуется **отдельный** ключ только для синка; его можно отозвать в Dashboard.
+- В облако уходит то, что вы отметили галочками и реально отправили (Push / автосейв).
+
+---
+
+## Лицензия
+
+MIT — см. [LICENSE](./LICENSE).
+
+---
+
+## Ссылки
+
+| | |
+|--|--|
+| Установка (GitHub) | https://github.com/shastitko1970-netizen/wucloud-sync |
+| WuProj | https://wuproj.com |
+| Dashboard | https://wuproj.com/dashboard |
+| Файлы ИИ | https://wuproj.com/dashboard?tab=files |
+| Баги и идеи | https://github.com/shastitko1970-netizen/wucloud-sync/issues |
