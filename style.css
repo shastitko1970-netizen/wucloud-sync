@@ -70,6 +70,18 @@
     line-height: 1.4 !important;
 }
 
+.wucloud-panel .wucloud-mode-hint {
+    margin: 0;
+    font-size: 0.8em;
+    line-height: 1.4;
+    opacity: 0.85;
+}
+
+.wucloud-panel .wucloud-stop-btn {
+    border-color: color-mix(in srgb, #ef4444 55%, transparent) !important;
+    color: #fca5a5 !important;
+}
+
 .wucloud-panel .wucloud-toggles {
     display: flex;
     flex-direction: column;

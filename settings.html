@@ -1,7 +1,7 @@
 <div id="wucloud-sync-panel" class="wucloud-panel">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b><i class="fa-solid fa-cloud"></i> WuCloud Sync <span class="wucloud-ver-badge">0.7.5</span></b>
+            <b><i class="fa-solid fa-cloud"></i> WuCloud Sync <span class="wucloud-ver-badge">0.8.0</span></b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content" style="display: none;">
@@ -40,7 +40,21 @@
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_lorebooks" checked> Лорбуки (World Info)</label>
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_presets" checked> Пресеты генерации</label>
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_use_gzip" checked> Gzip</label>
+                    <label class="wucloud-check"><input type="checkbox" id="wucloud_dual_write"> Dual-write в Dashboard (медленнее)</label>
                 </div>
+
+                <div class="wucloud-section-title">Чаты при Push</div>
+                <div class="wucloud-field">
+                    <label for="wucloud_chat_push_mode">Сколько диалогов слать</label>
+                    <select id="wucloud_chat_push_mode" class="text_pole">
+                        <option value="current">Только открытый чат (быстро)</option>
+                        <option value="character">Все чаты текущего персонажа</option>
+                        <option value="all">Все чаты всех персонажей</option>
+                    </select>
+                </div>
+                <p id="wucloud_chat_mode_hint" class="wucloud-mode-hint">
+                    Push отправит только открытый чат. Для bulk выбери «персонаж» или «все».
+                </p>
 
                 <div class="wucloud-section-title">Автосохранение диалогов</div>
                 <div class="wucloud-field">
@@ -55,6 +69,10 @@
                     <label for="wucloud_debounce_ms">Debounce / интервал (сек)</label>
                     <input type="number" id="wucloud_debounce_ms" class="text_pole" min="2" max="300" value="8">
                 </div>
+                <div class="wucloud-field">
+                    <label for="wucloud_request_timeout">Таймаут запроса (сек)</label>
+                    <input type="number" id="wucloud_request_timeout" class="text_pole" min="15" max="600" value="90">
+                </div>
 
                 <div class="wucloud-buttons">
                     <button id="wucloud_push_btn" class="menu_button" type="button">
@@ -68,6 +86,9 @@
                     </button>
                     <button id="wucloud_pull_btn" class="menu_button" type="button">
                         <i class="fa-solid fa-cloud-arrow-down"></i> Pull
+                    </button>
+                    <button id="wucloud_stop_btn" class="menu_button wucloud-stop-btn" type="button" style="display:none;" title="Остановить текущий Push">
+                        <i class="fa-solid fa-stop"></i> Стоп
                     </button>
                 </div>
 
@@ -84,7 +105,7 @@
                 <pre id="wucloud_log" class="wucloud-log" aria-live="polite"></pre>
 
                 <div class="wucloud-foot">
-                    <span>v0.7.5</span>
+                    <span>v0.8.0</span>
                     ·
                     <a href="https://github.com/shastitko1970-netizen/wucloud-sync" target="_blank" rel="noopener">GitHub</a>
                     · branch: main / wucloud

@@ -1,5 +1,5 @@
 /**
- * WuCloud Sync — SillyTavern extension v0.7.5
+ * WuCloud Sync — SillyTavern extension v0.8.0
  * Cloud backup to WuProj: characters, chats (lossless gzip blobs), personas, lorebooks, presets.
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
  * Branch: main or wucloud
@@ -11,7 +11,14 @@ const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
+const EXT_VERSION = '0.8.0';
 
+/**
+ * chat_push_mode:
+ *   current   — only open chat (fast, default)
+ *   character — all chats of the selected character
+ *   all       — all chats of every character (slow, cooperative)
+ */
 const defaultSettings = Object.freeze({
     api_key: '',
     base_url: 'https://api.wuproj.com',
@@ -24,14 +31,21 @@ const defaultSettings = Object.freeze({
     autosave: 'off', // off | message | interval
     debounce_sec: 8,
     use_gzip: true,
+    chat_push_mode: 'current', // current | character | all
+    // Dual-write to platform /chats for Dashboard preview. Heavy — off by default.
+    dual_write_platform: false,
+    request_timeout_sec: 90,
 });
 
 /** @type {Record<string, { cloud_id?: number, content_hash?: string }>} */
 let idMap = {};
 let mapLoaded = false;
+let mapDirty = false;
+let mapSaveTimer = null;
 let autosaveTimer = null;
 let intervalHandle = null;
 let pushInFlight = false;
+let pushAbort = null;
 
 function ctx() {
     try {
@@ -95,18 +109,56 @@ async function saveMap() {
         const lf = libs().localforage;
         if (lf) await lf.setItem(MAP_KEY, idMap);
         else localStorage.setItem(MAP_KEY, JSON.stringify(idMap));
+        mapDirty = false;
     } catch (e) {
         console.warn(LOG_PREFIX, 'map save', e);
     }
+}
+
+/** Debounced map flush — avoid localforage write after every single chat. */
+async function flushMap(force = false) {
+    if (mapSaveTimer) {
+        clearTimeout(mapSaveTimer);
+        mapSaveTimer = null;
+    }
+    if (!mapDirty && !force) return;
+    await saveMap();
+}
+
+function scheduleMapSave() {
+    mapDirty = true;
+    if (mapSaveTimer) return;
+    mapSaveTimer = setTimeout(() => {
+        mapSaveTimer = null;
+        saveMap().catch(() => {});
+    }, 800);
 }
 
 function mapGet(key) {
     return idMap[key] || null;
 }
 
-async function mapSet(key, cloudId, hash) {
+async function mapSet(key, cloudId, hash, { flush = false } = {}) {
     idMap[key] = { cloud_id: cloudId, content_hash: hash };
-    await saveMap();
+    mapDirty = true;
+    if (flush) await flushMap(true);
+    else scheduleMapSave();
+}
+
+/** Let the browser paint / handle input between heavy items. */
+function yieldToUI(ms = 0) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function chatPushMode() {
+    const m = String(getSettings().chat_push_mode || 'current').toLowerCase();
+    if (m === 'character' || m === 'all') return m;
+    return 'current';
+}
+
+function requestTimeoutMs() {
+    const sec = Number(getSettings().request_timeout_sec);
+    return Math.max(15, Number.isFinite(sec) ? sec : 90) * 1000;
 }
 
 /** Ring buffer — survives re-render; shown in panel + Copy/Full */
@@ -320,11 +372,30 @@ async function apiFetch(path, { method = 'GET', body = null, formData = null } =
     }
 
     const url = `${baseUrl()}${path}`;
+    const timeoutMs = requestTimeoutMs();
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    // Link outer cancel (Stop) if bulk push is running
+    const onOuterAbort = () => ctrl.abort();
+    if (pushAbort) {
+        if (pushAbort.aborted) {
+            clearTimeout(timer);
+            throw new Error('Отменено');
+        }
+        pushAbort.addEventListener('abort', onOuterAbort, { once: true });
+    }
     let res;
     try {
-        res = await fetch(url, { method, headers, body: payload });
+        res = await fetch(url, { method, headers, body: payload, signal: ctrl.signal });
     } catch (e) {
+        if (e?.name === 'AbortError') {
+            if (pushAbort?.aborted) throw new Error('Отменено');
+            throw new Error(`Таймаут ${Math.round(timeoutMs / 1000)}с: ${path}`);
+        }
         throw new Error(`Сеть: ${e.message} (url=${url}). Проверьте base URL и CORS.`);
+    } finally {
+        clearTimeout(timer);
+        if (pushAbort) pushAbort.removeEventListener('abort', onOuterAbort);
     }
     const text = await res.text();
     let json = null;
@@ -439,15 +510,17 @@ async function pushChatPayload({ clientKey, title, jsonl }) {
     const id = res?.id;
     if (id) await mapSet(clientKey, id, hash);
 
-    // Best-effort dual-write to platform chats for Dashboard preview (lossy OK)
-    try {
-        const fd2 = new FormData();
-        fd2.append('file', new Blob([jsonl], { type: 'application/jsonl' }), `${safeName}.jsonl`);
-        fd2.append('client_key', `platform:${clientKey}`);
-        fd2.append('content_hash', hash);
-        fd2.append('title', title || safeName);
-        await apiFetch('/api/v2/chats/import', { method: 'POST', formData: fd2 });
-    } catch (_) { /* non-fatal */ }
+    // Optional dual-write to platform chats for Dashboard preview (lossy, slow)
+    if (getSettings().dual_write_platform) {
+        try {
+            const fd2 = new FormData();
+            fd2.append('file', new Blob([jsonl], { type: 'application/jsonl' }), `${safeName}.jsonl`);
+            fd2.append('client_key', `platform:${clientKey}`);
+            fd2.append('content_hash', hash);
+            fd2.append('title', title || safeName);
+            await apiFetch('/api/v2/chats/import', { method: 'POST', formData: fd2 });
+        } catch (_) { /* non-fatal */ }
+    }
 
     return res;
 }
@@ -475,18 +548,10 @@ async function pushCurrentChat() {
     });
 }
 
-/**
- * Best-effort: list chat files for current character via ST API.
- * Falls back to current chat only.
- */
-async function pushAllChatsForCurrentCharacter() {
-    const c = ctx();
-    const char = c.characters?.[c.characterId];
-    if (!char) return { pushed: 0, skipped: 0, errors: 0 };
-
+async function listChatFilesForCharacter(char) {
+    if (!char?.avatar) return [];
     let files = [];
     try {
-        // Official ST endpoint used by Manage chat files
         const res = await fetch('/api/characters/chats', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -497,59 +562,76 @@ async function pushAllChatsForCurrentCharacter() {
             files = Array.isArray(data) ? data : (data.chats || data.file_list || []);
         }
     } catch (e) {
-        logLine(`list chats: ${e.message}`);
+        logLine(`list chats ${char.name || char.avatar}: ${e.message}`);
     }
-
-    // Normalize to list of { file_name }
-    files = files.map(f => {
+    return files.map(f => {
         if (typeof f === 'string') return { file_name: f };
         return { file_name: f.file_name || f.filename || f.name || f };
     }).filter(f => f.file_name);
+}
 
+async function loadChatArray(char, fileName) {
+    const getRes = await fetch('/api/characters/get', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            avatar_url: char.avatar,
+            file_name: fileName,
+        }),
+    });
+    if (getRes.ok) return getRes.json();
+    const alt = await fetch('/api/chats/get', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            avatar_url: char.avatar,
+            file_name: String(fileName).replace(/\.jsonl$/i, ''),
+        }),
+    });
+    if (alt.ok) return alt.json();
+    return null;
+}
+
+/**
+ * Push all chat files for one character. Yields to UI between items.
+ */
+async function pushChatsForCharacter(char, { progressLabel = '' } = {}) {
+    if (!char?.avatar) return { pushed: 0, skipped: 0, errors: 0 };
+    const files = await listChatFilesForCharacter(char);
     if (!files.length) {
-        const r = await pushCurrentChat();
-        return {
-            pushed: r?.skipped ? 0 : 1,
-            skipped: r?.skipped ? 1 : 0,
-            errors: 0,
-        };
+        // Only fall back to in-memory chat if this is the currently open character
+        const c = ctx();
+        const cur = c.characters?.[c.characterId];
+        if (cur?.avatar === char.avatar && c?.chat?.length) {
+            const r = await pushCurrentChat();
+            return {
+                pushed: r?.skipped ? 0 : 1,
+                skipped: r?.skipped ? 1 : 0,
+                errors: 0,
+            };
+        }
+        return { pushed: 0, skipped: 0, errors: 0 };
     }
 
     let pushed = 0, skipped = 0, errors = 0;
-    for (const f of files) {
+    const total = files.length;
+    for (let i = 0; i < files.length; i++) {
+        if (pushAbort?.aborted) break;
+        const f = files[i];
         try {
-            setStatus(`Чат: ${f.file_name}…`, 'busy');
-            const getRes = await fetch('/api/characters/get', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    avatar_url: char.avatar,
-                    file_name: f.file_name,
-                }),
-            });
-            // Some ST builds use /api/chats/get
-            let chatArr = null;
-            if (getRes.ok) {
-                chatArr = await getRes.json();
-            } else {
-                const alt = await fetch('/api/chats/get', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        avatar_url: char.avatar,
-                        file_name: String(f.file_name).replace(/\.jsonl$/i, ''),
-                    }),
-                });
-                if (alt.ok) chatArr = await alt.json();
+            const label = progressLabel || (char.name || char.avatar);
+            setStatus(`Чат ${i + 1}/${total} · ${label}: ${f.file_name}`, 'busy');
+            if (i > 0 && i % 5 === 0) {
+                logLine(`… ${label}: ${i}/${total} (push ${pushed}, skip ${skipped}, err ${errors})`);
             }
+            const chatArr = await loadChatArray(char, f.file_name);
             if (!Array.isArray(chatArr) || !chatArr.length) {
                 skipped++;
+                await yieldToUI(0);
                 continue;
             }
-            // ST sometimes returns [meta, ...messages]
-            const messages = chatArr;
             const clientKey = `chat:${char.avatar}:${f.file_name}`;
-            const jsonl = buildChatJsonlFromArray(messages, {
+            const jsonl = buildChatJsonlFromArray(chatArr, {
                 character_name: char.name,
             });
             const r = await pushChatPayload({
@@ -560,11 +642,71 @@ async function pushAllChatsForCurrentCharacter() {
             if (r?.skipped) skipped++;
             else pushed++;
         } catch (e) {
+            if (e?.message === 'Отменено') throw e;
             errors++;
-            logLine(`chat ${f.file_name}: ${e.message}`);
+            logLine(`chat ${char.name || char.avatar}/${f.file_name}: ${e.message}`);
         }
+        // Cooperative multitasking — keep ST responsive on large libraries
+        await yieldToUI(i % 3 === 0 ? 8 : 0);
     }
     return { pushed, skipped, errors };
+}
+
+async function pushAllChatsForCurrentCharacter() {
+    const c = ctx();
+    const char = c.characters?.[c.characterId];
+    if (!char) return { pushed: 0, skipped: 0, errors: 0 };
+    return pushChatsForCharacter(char);
+}
+
+/**
+ * All chats for every character (can take a long time).
+ */
+async function pushAllChatsForAllCharacters() {
+    const c = ctx();
+    const chars = (c.characters || []).filter(ch => ch?.avatar);
+    let pushed = 0, skipped = 0, errors = 0;
+    logLine(`chats all: ${chars.length} characters…`);
+    for (let i = 0; i < chars.length; i++) {
+        if (pushAbort?.aborted) break;
+        const char = chars[i];
+        setStatus(`Персонаж ${i + 1}/${chars.length}: ${char.name || char.avatar}…`, 'busy');
+        try {
+            const r = await pushChatsForCharacter(char, {
+                progressLabel: `${i + 1}/${chars.length} ${char.name || char.avatar}`,
+            });
+            pushed += r.pushed || 0;
+            skipped += r.skipped || 0;
+            errors += r.errors || 0;
+            if ((r.pushed || r.skipped || r.errors) && (i % 2 === 0 || r.pushed)) {
+                logLine(`chats · ${char.name || char.avatar}: +${r.pushed} skip ${r.skipped} err ${r.errors}`);
+            }
+        } catch (e) {
+            if (e?.message === 'Отменено') throw e;
+            errors++;
+            logLine(`chats char ${char.name}: ${e.message}`);
+        }
+        await yieldToUI(16);
+    }
+    return { pushed, skipped, errors };
+}
+
+/**
+ * Resolve which chats to push from settings (or explicit override).
+ * @param {'current'|'character'|'all'|null} override
+ */
+async function pushChatsByMode(override = null) {
+    const mode = override || chatPushMode();
+    if (mode === 'all') return pushAllChatsForAllCharacters();
+    if (mode === 'character') return pushAllChatsForCurrentCharacter();
+    // current
+    const r = await pushCurrentChat();
+    return {
+        pushed: r?.skipped ? 0 : 1,
+        skipped: r?.skipped ? 1 : 0,
+        errors: 0,
+        current: r,
+    };
 }
 
 // ─── ST settings helpers ──────────────────────────────────────────────────
@@ -1412,17 +1554,25 @@ async function syncPull({ importCharacters = true } = {}) {
 
 // ─── Orchestration ────────────────────────────────────────────────────────
 
-async function syncPush({ onlyCurrentChat = false, allChats = false } = {}) {
+/**
+ * @param {object} opts
+ * @param {boolean} [opts.onlyCurrentChat] force single open chat
+ * @param {'current'|'character'|'all'|null} [opts.chatMode] override settings chat_push_mode
+ */
+async function syncPush({ onlyCurrentChat = false, chatMode = null } = {}) {
     if (pushInFlight) {
         setStatus('Уже идёт синхронизация…', 'busy');
         return;
     }
     pushInFlight = true;
+    pushAbort = new AbortController();
+    setStopButtonVisible(true);
     await loadMap();
     setStatus('Синхронизация…', 'busy');
     const s = getSettings();
     const stats = { characters: 0, chats: 0, personas: 0, lorebooks: 0, presets: 0, skipped: 0, errors: 0 };
-    logLine(`push flags: char=${!!s.sync_characters} chat=${!!s.sync_chats} persona=${!!s.sync_personas} lore=${!!s.sync_lorebooks} preset=${!!s.sync_presets} gzip=${!!s.use_gzip}`);
+    const mode = onlyCurrentChat ? 'current' : (chatMode || chatPushMode());
+    logLine(`push flags: char=${!!s.sync_characters} chat=${!!s.sync_chats} mode=${mode} persona=${!!s.sync_personas} lore=${!!s.sync_lorebooks} preset=${!!s.sync_presets} gzip=${!!s.use_gzip} dual=${!!s.dual_write_platform}`);
 
     try {
         if (onlyCurrentChat) {
@@ -1436,6 +1586,7 @@ async function syncPush({ onlyCurrentChat = false, allChats = false } = {}) {
                 stats.errors++;
                 logLine(`chat error: ${e.message}`);
             }
+            await flushMap(true);
             const ok = !stats.errors;
             setStatus(ok ? 'Текущий чат синхронизирован' : 'Ошибка чата (лог)', ok ? 'ok' : 'err');
             if (ok) toast('success', 'Чат сохранён в облако');
@@ -1444,41 +1595,50 @@ async function syncPush({ onlyCurrentChat = false, allChats = false } = {}) {
 
         if (s.sync_chats) {
             try {
-                if (allChats) {
-                    const r = await pushAllChatsForCurrentCharacter();
-                    stats.chats += r.pushed || 0;
-                    stats.skipped += r.skipped || 0;
-                    stats.errors += r.errors || 0;
-                    logLine(`chats batch: +${r.pushed} skip ${r.skipped} err ${r.errors}`);
+                const r = await pushChatsByMode(mode);
+                stats.chats += r.pushed || 0;
+                stats.skipped += r.skipped || 0;
+                stats.errors += r.errors || 0;
+                if (mode === 'current' && r.current) {
+                    const cid = r.current?.id ?? r.current?.chat_id ?? r.current?.blob_id;
+                    logLine(r.current?.skipped
+                        ? `chat skip: ${r.current.reason || 'ok'}`
+                        : `chat → #${cid} (${r.current?.encoding || 'ok'})`);
                 } else {
-                    const r = await pushCurrentChat();
-                    if (r?.skipped) stats.skipped++;
-                    else stats.chats++;
-                    const cid = r?.id ?? r?.chat_id ?? r?.blob_id;
-                    logLine(r?.skipped ? `chat skip: ${r.reason || 'ok'}` : `chat → #${cid} (${r?.encoding || 'ok'})`);
+                    logLine(`chats [${mode}]: +${r.pushed || 0} skip ${r.skipped || 0} err ${r.errors || 0}`);
                 }
             } catch (e) {
-                stats.errors++;
-                logLine(`chat: ${e.message}`);
+                if (e?.message === 'Отменено') {
+                    logLine('chats: отменено пользователем');
+                    stats.errors++;
+                } else {
+                    stats.errors++;
+                    logLine(`chat: ${e.message}`);
+                }
             }
         }
 
-        if (s.sync_characters) {
+        if (s.sync_characters && !pushAbort?.aborted) {
             const c = ctx();
-            for (const char of (c.characters || [])) {
+            const list = c.characters || [];
+            for (let i = 0; i < list.length; i++) {
+                if (pushAbort?.aborted) break;
+                const char = list[i];
                 try {
-                    setStatus(`Персонаж: ${char.name || char.avatar}…`, 'busy');
+                    setStatus(`Персонаж ${i + 1}/${list.length}: ${char.name || char.avatar}…`, 'busy');
                     const r = await pushCharacter(char);
                     if (r?.skipped) stats.skipped++;
                     else stats.characters++;
                 } catch (e) {
+                    if (e?.message === 'Отменено') break;
                     stats.errors++;
                     logLine(`char ${char?.name}: ${e.message}`);
                 }
+                await yieldToUI(i % 4 === 0 ? 8 : 0);
             }
         }
 
-        if (s.sync_personas) {
+        if (s.sync_personas && !pushAbort?.aborted) {
             try {
                 const r = await pushPersonas();
                 stats.personas += r.pushed || 0;
@@ -1488,11 +1648,11 @@ async function syncPush({ onlyCurrentChat = false, allChats = false } = {}) {
                 stats.errors++;
                 logLine(`personas: ${e.message}`);
             }
-        } else {
+        } else if (!s.sync_personas) {
             logLine('personas: выкл в настройках мода (галочка)');
         }
 
-        if (s.sync_lorebooks) {
+        if (s.sync_lorebooks && !pushAbort?.aborted) {
             try {
                 const r = await pushLorebooks();
                 stats.lorebooks += r.pushed || 0;
@@ -1502,11 +1662,11 @@ async function syncPush({ onlyCurrentChat = false, allChats = false } = {}) {
                 stats.errors++;
                 logLine(`lorebooks: ${e.message}`);
             }
-        } else {
+        } else if (!s.sync_lorebooks) {
             logLine('lorebooks: выкл в настройках мода (галочка)');
         }
 
-        if (s.sync_presets) {
+        if (s.sync_presets && !pushAbort?.aborted) {
             try {
                 const r = await pushPresets();
                 stats.presets += r.pushed || 0;
@@ -1516,21 +1676,43 @@ async function syncPush({ onlyCurrentChat = false, allChats = false } = {}) {
                 stats.errors++;
                 logLine(`presets: ${e.message}`);
             }
-        } else {
+        } else if (!s.sync_presets) {
             logLine('presets: выкл в настройках мода (галочка)');
         }
 
-        const summary = `Готово · char ${stats.characters} · chat ${stats.chats} · persona ${stats.personas} · lore ${stats.lorebooks} · preset ${stats.presets} · skip ${stats.skipped} · err ${stats.errors}`;
-        setStatus(summary, stats.errors ? 'err' : 'ok');
-        toast(stats.errors ? 'warning' : 'success', summary);
+        await flushMap(true);
+        const cancelled = !!pushAbort?.aborted;
+        const summary = `${cancelled ? 'Остановлено' : 'Готово'} · char ${stats.characters} · chat ${stats.chats} · persona ${stats.personas} · lore ${stats.lorebooks} · preset ${stats.presets} · skip ${stats.skipped} · err ${stats.errors}`;
+        setStatus(summary, stats.errors || cancelled ? 'err' : 'ok');
+        toast(stats.errors || cancelled ? 'warning' : 'success', summary);
         logLine(summary);
     } catch (e) {
         setStatus(`Ошибка: ${e.message}`, 'err');
         toast('error', e.message);
         logLine(e.message);
+        await flushMap(true).catch(() => {});
     } finally {
         pushInFlight = false;
+        pushAbort = null;
+        setStopButtonVisible(false);
     }
+}
+
+function cancelPush() {
+    if (!pushInFlight || !pushAbort) {
+        setStatus('Нечего останавливать', 'ok');
+        return;
+    }
+    pushAbort.abort();
+    setStatus('Останавливаю…', 'busy');
+    logLine('stop: запрос отмены');
+}
+
+function setStopButtonVisible(visible) {
+    const el = document.getElementById('wucloud_stop_btn');
+    if (!el) return;
+    el.style.display = visible ? '' : 'none';
+    el.disabled = !visible;
 }
 
 // ─── Autosave ─────────────────────────────────────────────────────────────
@@ -1605,12 +1787,14 @@ function bindUi() {
     bindText('wucloud_api_key', 'api_key');
     bindText('wucloud_base_url', 'base_url');
     bindText('wucloud_debounce_ms', 'debounce_sec');
+    bindText('wucloud_request_timeout', 'request_timeout_sec');
     bindCheck('wucloud_sync_characters', 'sync_characters');
     bindCheck('wucloud_sync_chats', 'sync_chats');
     bindCheck('wucloud_sync_personas', 'sync_personas');
     bindCheck('wucloud_sync_lorebooks', 'sync_lorebooks');
     bindCheck('wucloud_sync_presets', 'sync_presets');
     bindCheck('wucloud_use_gzip', 'use_gzip');
+    bindCheck('wucloud_dual_write', 'dual_write_platform');
 
     const auto = $('wucloud_autosave');
     if (auto) {
@@ -1622,15 +1806,44 @@ function bindUi() {
         });
     }
 
-    $('wucloud_push_btn')?.addEventListener('click', () => syncPush({ allChats: false }));
-    $('wucloud_push_all_chats_btn')?.addEventListener('click', () => syncPush({ allChats: true }));
+    const chatMode = $('wucloud_chat_push_mode');
+    if (chatMode) {
+        chatMode.value = s.chat_push_mode || 'current';
+        chatMode.addEventListener('change', () => {
+            getSettings().chat_push_mode = chatMode.value;
+            persist();
+            updateChatModeHint();
+        });
+    }
+    updateChatModeHint();
+
+    $('wucloud_push_btn')?.addEventListener('click', () => syncPush({}));
+    // Quick overrides — still available, ignore settings mode for this click
+    $('wucloud_push_all_chats_btn')?.addEventListener('click', () => syncPush({
+        chatMode: 'character',
+    }));
     $('wucloud_push_chat_btn')?.addEventListener('click', () => syncPush({ onlyCurrentChat: true }));
     $('wucloud_pull_btn')?.addEventListener('click', () => syncPull({ importCharacters: true }));
+    $('wucloud_stop_btn')?.addEventListener('click', () => cancelPush());
     $('wucloud_test_btn')?.addEventListener('click', () => testConnection());
     $('wucloud_log_copy')?.addEventListener('click', () => copyLog());
     $('wucloud_log_clear')?.addEventListener('click', () => clearLog());
     $('wucloud_log_popup')?.addEventListener('click', () => showLogPopup());
+    setStopButtonVisible(false);
     renderLogPanel();
+}
+
+function updateChatModeHint() {
+    const el = document.getElementById('wucloud_chat_mode_hint');
+    if (!el) return;
+    const mode = chatPushMode();
+    if (mode === 'all') {
+        el.textContent = 'Push отправит все чаты всех персонажей (может занять много времени).';
+    } else if (mode === 'character') {
+        el.textContent = 'Push отправит все чаты текущего выбранного персонажа.';
+    } else {
+        el.textContent = 'Push отправит только открытый чат. Для bulk выбери «персонаж» или «все».';
+    }
 }
 
 async function init() {
@@ -1659,10 +1872,10 @@ async function init() {
     bindUi();
     bindEvents();
     setupIntervalAutosave();
-    logLine('WuCloud Sync 0.7.5 loaded · lore dual-write best-effort (blob is source of truth)');
-    setStatus('Готов · WuCloud Sync 0.7.5', 'ok');
-    toast('info', 'WuCloud 0.7.5');
-    console.log(LOG_PREFIX, 'loaded v0.7.5');
+    logLine(`WuCloud Sync ${EXT_VERSION} loaded · chat_mode=${chatPushMode()} · dual=${!!getSettings().dual_write_platform}`);
+    setStatus(`Готов · WuCloud Sync ${EXT_VERSION}`, 'ok');
+    toast('info', `WuCloud ${EXT_VERSION}`);
+    console.log(LOG_PREFIX, `loaded v${EXT_VERSION}`);
 }
 
 if (document.readyState === 'loading') {
