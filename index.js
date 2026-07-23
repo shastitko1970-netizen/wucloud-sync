@@ -1,5 +1,5 @@
 /**
- * WuCloud Sync — SillyTavern extension v0.8.0
+ * WuCloud Sync — SillyTavern extension v0.8.1
  * Cloud backup to WuProj: characters, chats (lossless gzip blobs), personas, lorebooks, presets.
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
  * Branch: main or wucloud
@@ -11,7 +11,7 @@ const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.8.0';
+const EXT_VERSION = '0.8.1';
 
 /**
  * chat_push_mode:
@@ -159,6 +159,49 @@ function chatPushMode() {
 function requestTimeoutMs() {
     const sec = Number(getSettings().request_timeout_sec);
     return Math.max(15, Number.isFinite(sec) ? sec : 90) * 1000;
+}
+
+/** True if the bulk-push AbortController was cancelled. */
+function isPushAborted() {
+    try {
+        return !!(pushAbort && pushAbort.signal && pushAbort.signal.aborted);
+    } catch (_) {
+        return false;
+    }
+}
+
+/**
+ * ST-local fetch headers (CSRF). Without X-CSRF-Token ST returns 403/empty
+ * and bulk chat listing silently finds 0 files.
+ */
+function stHeaders({ omitContentType = false } = {}) {
+    try {
+        const c = ctx();
+        if (typeof c.getRequestHeaders === 'function') {
+            return c.getRequestHeaders({ omitContentType });
+        }
+    } catch (_) { /* fall through */ }
+    const headers = {};
+    if (!omitContentType) headers['Content-Type'] = 'application/json';
+    try {
+        // ST global token used by getRequestHeaders
+        if (typeof token !== 'undefined' && token) headers['X-CSRF-Token'] = token;
+    } catch (_) { /* ignore */ }
+    return headers;
+}
+
+/** POST JSON to SillyTavern local API with CSRF + optional abort. */
+async function stFetch(url, body = null, { method = 'POST', omitContentType = false } = {}) {
+    const headers = stHeaders({ omitContentType });
+    const opts = { method, headers, cache: 'no-cache' };
+    if (body != null && method !== 'GET') {
+        opts.body = typeof body === 'string' || body instanceof FormData
+            ? body
+            : JSON.stringify(body);
+    }
+    if (pushAbort?.signal) opts.signal = pushAbort.signal;
+    const res = await fetch(url, opts);
+    return res;
 }
 
 /** Ring buffer — survives re-render; shown in panel + Copy/Full */
@@ -375,27 +418,28 @@ async function apiFetch(path, { method = 'GET', body = null, formData = null } =
     const timeoutMs = requestTimeoutMs();
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    // Link outer cancel (Stop) if bulk push is running
+    // Link outer cancel (Stop): AbortController has .signal, not addEventListener
     const onOuterAbort = () => ctrl.abort();
-    if (pushAbort) {
-        if (pushAbort.aborted) {
+    const outerSignal = pushAbort && pushAbort.signal ? pushAbort.signal : null;
+    if (outerSignal) {
+        if (outerSignal.aborted) {
             clearTimeout(timer);
             throw new Error('Отменено');
         }
-        pushAbort.addEventListener('abort', onOuterAbort, { once: true });
+        outerSignal.addEventListener('abort', onOuterAbort, { once: true });
     }
     let res;
     try {
         res = await fetch(url, { method, headers, body: payload, signal: ctrl.signal });
     } catch (e) {
         if (e?.name === 'AbortError') {
-            if (pushAbort?.aborted) throw new Error('Отменено');
+            if (isPushAborted()) throw new Error('Отменено');
             throw new Error(`Таймаут ${Math.round(timeoutMs / 1000)}с: ${path}`);
         }
         throw new Error(`Сеть: ${e.message} (url=${url}). Проверьте base URL и CORS.`);
     } finally {
         clearTimeout(timer);
-        if (pushAbort) pushAbort.removeEventListener('abort', onOuterAbort);
+        if (outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
     }
     const text = await res.text();
     let json = null;
@@ -548,48 +592,94 @@ async function pushCurrentChat() {
     });
 }
 
+/**
+ * List chat files for a character via ST API (needs CSRF).
+ * ST returns array of { file_name, file_id, ... } or { error: true }.
+ */
 async function listChatFilesForCharacter(char) {
     if (!char?.avatar) return [];
-    let files = [];
+    const label = char.name || char.avatar;
     try {
-        const res = await fetch('/api/characters/chats', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ avatar_url: char.avatar }),
+        // simple:true → lightweight list of file names (official ST endpoint)
+        const res = await stFetch('/api/characters/chats', {
+            avatar_url: char.avatar,
+            simple: true,
         });
-        if (res.ok) {
-            const data = await res.json();
-            files = Array.isArray(data) ? data : (data.chats || data.file_list || []);
+        if (!res.ok) {
+            logLine(`list chats ${label}: HTTP ${res.status} (CSRF/headers?)`);
+            // retry without simple for older ST
+            const res2 = await stFetch('/api/characters/chats', { avatar_url: char.avatar });
+            if (!res2.ok) {
+                logLine(`list chats ${label}: HTTP ${res2.status}`);
+                return [];
+            }
+            const data2 = await res2.json();
+            return normalizeChatFileList(data2, label);
         }
+        const data = await res.json();
+        return normalizeChatFileList(data, label);
     } catch (e) {
-        logLine(`list chats ${char.name || char.avatar}: ${e.message}`);
+        if (e?.name === 'AbortError' || e?.message === 'Отменено') throw new Error('Отменено');
+        logLine(`list chats ${label}: ${e.message}`);
+        return [];
     }
-    return files.map(f => {
-        if (typeof f === 'string') return { file_name: f };
-        return { file_name: f.file_name || f.filename || f.name || f };
-    }).filter(f => f.file_name);
 }
 
+function normalizeChatFileList(data, label = '') {
+    if (data == null) return [];
+    if (typeof data === 'object' && !Array.isArray(data) && data.error === true) {
+        logLine(`list chats ${label}: ST error (нет папки чатов?)`);
+        return [];
+    }
+    let files;
+    if (Array.isArray(data)) {
+        files = data;
+    } else if (typeof data === 'object') {
+        // ST getPastCharacterChats uses Object.values(data)
+        files = data.chats || data.file_list || Object.values(data);
+    } else {
+        files = [];
+    }
+    const out = files.map(f => {
+        if (typeof f === 'string') return { file_name: f };
+        if (!f || typeof f !== 'object') return null;
+        const name = f.file_name || f.filename || f.file_id || f.name;
+        if (!name || typeof name !== 'string') return null;
+        return { file_name: name, file_id: f.file_id || String(name).replace(/\.jsonl$/i, '') };
+    }).filter(Boolean);
+    return out;
+}
+
+/**
+ * Load full chat jsonl content from ST.
+ * Correct endpoint is /api/chats/get (NOT /api/characters/get — that returns the card).
+ * file_name must be WITHOUT .jsonl — server appends it.
+ */
 async function loadChatArray(char, fileName) {
-    const getRes = await fetch('/api/characters/get', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+    const bare = String(fileName || '').replace(/\.jsonl$/i, '');
+    if (!bare) return null;
+    try {
+        const res = await stFetch('/api/chats/get', {
+            ch_name: char.name || '',
+            file_name: bare,
             avatar_url: char.avatar,
-            file_name: fileName,
-        }),
-    });
-    if (getRes.ok) return getRes.json();
-    const alt = await fetch('/api/chats/get', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            avatar_url: char.avatar,
-            file_name: String(fileName).replace(/\.jsonl$/i, ''),
-        }),
-    });
-    if (alt.ok) return alt.json();
-    return null;
+        });
+        if (!res.ok) {
+            logLine(`chats/get ${char.name}/${bare}: HTTP ${res.status}`);
+            return null;
+        }
+        const data = await res.json();
+        // empty object {} when missing; array when ok
+        if (!Array.isArray(data)) {
+            logLine(`chats/get ${char.name}/${bare}: not array (${typeof data})`);
+            return null;
+        }
+        return data;
+    } catch (e) {
+        if (e?.name === 'AbortError') throw new Error('Отменено');
+        logLine(`chats/get ${char.name}/${bare}: ${e.message}`);
+        return null;
+    }
 }
 
 /**
@@ -598,11 +688,13 @@ async function loadChatArray(char, fileName) {
 async function pushChatsForCharacter(char, { progressLabel = '' } = {}) {
     if (!char?.avatar) return { pushed: 0, skipped: 0, errors: 0 };
     const files = await listChatFilesForCharacter(char);
+    logLine(`list ${char.name || char.avatar}: ${files.length} chat file(s)`);
     if (!files.length) {
         // Only fall back to in-memory chat if this is the currently open character
         const c = ctx();
         const cur = c.characters?.[c.characterId];
         if (cur?.avatar === char.avatar && c?.chat?.length) {
+            logLine(`list empty → fallback current open chat (${c.chat.length} msgs)`);
             const r = await pushCurrentChat();
             return {
                 pushed: r?.skipped ? 0 : 1,
@@ -616,7 +708,7 @@ async function pushChatsForCharacter(char, { progressLabel = '' } = {}) {
     let pushed = 0, skipped = 0, errors = 0;
     const total = files.length;
     for (let i = 0; i < files.length; i++) {
-        if (pushAbort?.aborted) break;
+        if (isPushAborted()) break;
         const f = files[i];
         try {
             const label = progressLabel || (char.name || char.avatar);
@@ -630,13 +722,15 @@ async function pushChatsForCharacter(char, { progressLabel = '' } = {}) {
                 await yieldToUI(0);
                 continue;
             }
-            const clientKey = `chat:${char.avatar}:${f.file_name}`;
+            // Prefer stable file_id / name with extension for client_key
+            const keyName = f.file_name.endsWith('.jsonl') ? f.file_name : `${String(f.file_name).replace(/\.jsonl$/i, '')}.jsonl`;
+            const clientKey = `chat:${char.avatar}:${keyName}`;
             const jsonl = buildChatJsonlFromArray(chatArr, {
                 character_name: char.name,
             });
             const r = await pushChatPayload({
                 clientKey,
-                title: `${char.name} · ${f.file_name}`,
+                title: `${char.name} · ${keyName}`,
                 jsonl,
             });
             if (r?.skipped) skipped++;
@@ -654,8 +748,14 @@ async function pushChatsForCharacter(char, { progressLabel = '' } = {}) {
 
 async function pushAllChatsForCurrentCharacter() {
     const c = ctx();
-    const char = c.characters?.[c.characterId];
-    if (!char) return { pushed: 0, skipped: 0, errors: 0 };
+    // characterId may be string index
+    const id = c.characterId ?? c.this_chid;
+    const char = (id != null && c.characters) ? c.characters[id] : null;
+    if (!char?.avatar) {
+        logLine('chats character: нет выбранного персонажа — открой карточку в ST');
+        return { pushed: 0, skipped: 0, errors: 1 };
+    }
+    logLine(`chats character: ${char.name || char.avatar}`);
     return pushChatsForCharacter(char);
 }
 
@@ -668,7 +768,7 @@ async function pushAllChatsForAllCharacters() {
     let pushed = 0, skipped = 0, errors = 0;
     logLine(`chats all: ${chars.length} characters…`);
     for (let i = 0; i < chars.length; i++) {
-        if (pushAbort?.aborted) break;
+        if (isPushAborted()) break;
         const char = chars[i];
         setStatus(`Персонаж ${i + 1}/${chars.length}: ${char.name || char.avatar}…`, 'busy');
         try {
@@ -678,9 +778,8 @@ async function pushAllChatsForAllCharacters() {
             pushed += r.pushed || 0;
             skipped += r.skipped || 0;
             errors += r.errors || 0;
-            if ((r.pushed || r.skipped || r.errors) && (i % 2 === 0 || r.pushed)) {
-                logLine(`chats · ${char.name || char.avatar}: +${r.pushed} skip ${r.skipped} err ${r.errors}`);
-            }
+            // Always log per-character so bulk progress is visible
+            logLine(`chats · ${char.name || char.avatar}: +${r.pushed} skip ${r.skipped} err ${r.errors}`);
         } catch (e) {
             if (e?.message === 'Отменено') throw e;
             errors++;
@@ -714,8 +813,14 @@ async function pushChatsByMode(override = null) {
 /** Full ST settings (includes power_user). */
 async function fetchSTSettings() {
     try {
-        const res = await fetch('/api/settings/get');
-        if (res.ok) return await res.json();
+        const res = await stFetch('/api/settings/get', null, { method: 'GET' });
+        // some ST builds only accept POST
+        if (!res.ok) {
+            const res2 = await stFetch('/api/settings/get', {});
+            if (res2.ok) return await res2.json();
+            return null;
+        }
+        return await res.json();
     } catch (e) {
         logLine(`settings/get: ${e.message}`);
     }
@@ -1558,8 +1663,9 @@ async function syncPull({ importCharacters = true } = {}) {
  * @param {object} opts
  * @param {boolean} [opts.onlyCurrentChat] force single open chat
  * @param {'current'|'character'|'all'|null} [opts.chatMode] override settings chat_push_mode
+ * @param {boolean} [opts.chatsOnly] only push chats (bulk buttons); skip cards/personas/…
  */
-async function syncPush({ onlyCurrentChat = false, chatMode = null } = {}) {
+async function syncPush({ onlyCurrentChat = false, chatMode = null, chatsOnly = false } = {}) {
     if (pushInFlight) {
         setStatus('Уже идёт синхронизация…', 'busy');
         return;
@@ -1572,7 +1678,7 @@ async function syncPush({ onlyCurrentChat = false, chatMode = null } = {}) {
     const s = getSettings();
     const stats = { characters: 0, chats: 0, personas: 0, lorebooks: 0, presets: 0, skipped: 0, errors: 0 };
     const mode = onlyCurrentChat ? 'current' : (chatMode || chatPushMode());
-    logLine(`push flags: char=${!!s.sync_characters} chat=${!!s.sync_chats} mode=${mode} persona=${!!s.sync_personas} lore=${!!s.sync_lorebooks} preset=${!!s.sync_presets} gzip=${!!s.use_gzip} dual=${!!s.dual_write_platform}`);
+    logLine(`push flags: char=${!!s.sync_characters && !chatsOnly} chat=${!!s.sync_chats || chatsOnly || onlyCurrentChat} mode=${mode} chatsOnly=${!!chatsOnly} persona=${!!s.sync_personas && !chatsOnly} lore=${!!s.sync_lorebooks && !chatsOnly} preset=${!!s.sync_presets && !chatsOnly} gzip=${!!s.use_gzip} dual=${!!s.dual_write_platform}`);
 
     try {
         if (onlyCurrentChat) {
@@ -1593,7 +1699,8 @@ async function syncPush({ onlyCurrentChat = false, chatMode = null } = {}) {
             return;
         }
 
-        if (s.sync_chats) {
+        // Always push chats for bulk buttons; otherwise respect checkbox
+        if (s.sync_chats || chatsOnly) {
             try {
                 const r = await pushChatsByMode(mode);
                 stats.chats += r.pushed || 0;
@@ -1618,11 +1725,11 @@ async function syncPush({ onlyCurrentChat = false, chatMode = null } = {}) {
             }
         }
 
-        if (s.sync_characters && !pushAbort?.aborted) {
+        if (!chatsOnly && s.sync_characters && !isPushAborted()) {
             const c = ctx();
             const list = c.characters || [];
             for (let i = 0; i < list.length; i++) {
-                if (pushAbort?.aborted) break;
+                if (isPushAborted()) break;
                 const char = list[i];
                 try {
                     setStatus(`Персонаж ${i + 1}/${list.length}: ${char.name || char.avatar}…`, 'busy');
@@ -1638,7 +1745,7 @@ async function syncPush({ onlyCurrentChat = false, chatMode = null } = {}) {
             }
         }
 
-        if (s.sync_personas && !pushAbort?.aborted) {
+        if (!chatsOnly && s.sync_personas && !isPushAborted()) {
             try {
                 const r = await pushPersonas();
                 stats.personas += r.pushed || 0;
@@ -1648,11 +1755,11 @@ async function syncPush({ onlyCurrentChat = false, chatMode = null } = {}) {
                 stats.errors++;
                 logLine(`personas: ${e.message}`);
             }
-        } else if (!s.sync_personas) {
+        } else if (!chatsOnly && !s.sync_personas) {
             logLine('personas: выкл в настройках мода (галочка)');
         }
 
-        if (s.sync_lorebooks && !pushAbort?.aborted) {
+        if (!chatsOnly && s.sync_lorebooks && !isPushAborted()) {
             try {
                 const r = await pushLorebooks();
                 stats.lorebooks += r.pushed || 0;
@@ -1662,11 +1769,11 @@ async function syncPush({ onlyCurrentChat = false, chatMode = null } = {}) {
                 stats.errors++;
                 logLine(`lorebooks: ${e.message}`);
             }
-        } else if (!s.sync_lorebooks) {
+        } else if (!chatsOnly && !s.sync_lorebooks) {
             logLine('lorebooks: выкл в настройках мода (галочка)');
         }
 
-        if (s.sync_presets && !pushAbort?.aborted) {
+        if (!chatsOnly && s.sync_presets && !isPushAborted()) {
             try {
                 const r = await pushPresets();
                 stats.presets += r.pushed || 0;
@@ -1676,12 +1783,12 @@ async function syncPush({ onlyCurrentChat = false, chatMode = null } = {}) {
                 stats.errors++;
                 logLine(`presets: ${e.message}`);
             }
-        } else if (!s.sync_presets) {
+        } else if (!chatsOnly && !s.sync_presets) {
             logLine('presets: выкл в настройках мода (галочка)');
         }
 
         await flushMap(true);
-        const cancelled = !!pushAbort?.aborted;
+        const cancelled = isPushAborted();
         const summary = `${cancelled ? 'Остановлено' : 'Готово'} · char ${stats.characters} · chat ${stats.chats} · persona ${stats.personas} · lore ${stats.lorebooks} · preset ${stats.presets} · skip ${stats.skipped} · err ${stats.errors}`;
         setStatus(summary, stats.errors || cancelled ? 'err' : 'ok');
         toast(stats.errors || cancelled ? 'warning' : 'success', summary);
@@ -1818,10 +1925,19 @@ function bindUi() {
     updateChatModeHint();
 
     $('wucloud_push_btn')?.addEventListener('click', () => syncPush({}));
-    // Quick overrides — still available, ignore settings mode for this click
+    // Chat bulk overrides (chats only — ignore cards/personas/presets this run)
     $('wucloud_push_all_chats_btn')?.addEventListener('click', () => syncPush({
         chatMode: 'character',
+        chatsOnly: true,
     }));
+    $('wucloud_push_all_lib_btn')?.addEventListener('click', () => {
+        const ok = confirm(
+            'Выгрузить ВСЕ чаты ВСЕХ персонажей в облако?\n\n'
+            + 'Это может занять много времени. Можно нажать «Стоп».',
+        );
+        if (!ok) return;
+        syncPush({ chatMode: 'all', chatsOnly: true });
+    });
     $('wucloud_push_chat_btn')?.addEventListener('click', () => syncPush({ onlyCurrentChat: true }));
     $('wucloud_pull_btn')?.addEventListener('click', () => syncPull({ importCharacters: true }));
     $('wucloud_stop_btn')?.addEventListener('click', () => cancelPush());

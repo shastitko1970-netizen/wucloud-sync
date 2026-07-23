@@ -7,7 +7,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "WuProj",
-    "version": "0.8.0",
+    "version": "0.8.1",
     "homePage": "https://github.com/shastitko1970-netizen/wucloud-sync",
     "auto_update": true,
     "minimum_client_version": "1.12.0"

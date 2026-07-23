@@ -1,7 +1,7 @@
 <div id="wucloud-sync-panel" class="wucloud-panel">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b><i class="fa-solid fa-cloud"></i> WuCloud Sync <span class="wucloud-ver-badge">0.8.0</span></b>
+            <b><i class="fa-solid fa-cloud"></i> WuCloud Sync <span class="wucloud-ver-badge">0.8.1</span></b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content" style="display: none;">
@@ -12,8 +12,8 @@
                     Ключ: только <b>wu-…</b> из Dashboard → API keys.
                 </p>
                 <p class="wucloud-hint">
-                    Логи мода <b>не</b> пишутся в Server log ST — смотри блок «Журнал» ниже или toasts.
-                    F12 → Console тоже показывает <code>[WuCloud]</code>.
+                    Логи мода <b>не</b> пишутся в Server log ST — смотри блок «Журнал» ниже.
+                    F12 → Console: <code>[WuCloud]</code>.
                 </p>
 
                 <div class="wucloud-field">
@@ -32,7 +32,7 @@
                     </button>
                 </div>
 
-                <div class="wucloud-section-title">Что синхронизировать</div>
+                <div class="wucloud-section-title">Что синхронизировать (кнопка Push)</div>
                 <div class="wucloud-toggles">
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_characters" checked> Персонажи (карты)</label>
                     <label class="wucloud-check"><input type="checkbox" id="wucloud_sync_chats" checked> Диалоги (чаты)</label>
@@ -53,7 +53,7 @@
                     </select>
                 </div>
                 <p id="wucloud_chat_mode_hint" class="wucloud-mode-hint">
-                    Push отправит только открытый чат. Для bulk выбери «персонаж» или «все».
+                    Push отправит только открытый чат. Bulk-кнопки ниже всегда шлют чаты.
                 </p>
 
                 <div class="wucloud-section-title">Автосохранение диалогов</div>
@@ -74,15 +74,19 @@
                     <input type="number" id="wucloud_request_timeout" class="text_pole" min="15" max="600" value="90">
                 </div>
 
+                <div class="wucloud-section-title">Действия</div>
                 <div class="wucloud-buttons">
-                    <button id="wucloud_push_btn" class="menu_button" type="button">
+                    <button id="wucloud_push_btn" class="menu_button" type="button" title="Всё по галочкам + режим чатов из настройки">
                         <i class="fa-solid fa-cloud-arrow-up"></i> Push
                     </button>
                     <button id="wucloud_push_chat_btn" class="menu_button" type="button">
                         <i class="fa-solid fa-comment"></i> Текущий чат
                     </button>
-                    <button id="wucloud_push_all_chats_btn" class="menu_button" type="button">
-                        <i class="fa-solid fa-comments"></i> Все чаты персонажа
+                    <button id="wucloud_push_all_chats_btn" class="menu_button" type="button" title="Только чаты выбранного персонажа">
+                        <i class="fa-solid fa-comments"></i> Чаты персонажа
+                    </button>
+                    <button id="wucloud_push_all_lib_btn" class="menu_button" type="button" title="Только чаты: все персонажи">
+                        <i class="fa-solid fa-database"></i> ВСЕ чаты
                     </button>
                     <button id="wucloud_pull_btn" class="menu_button" type="button">
                         <i class="fa-solid fa-cloud-arrow-down"></i> Pull
@@ -105,7 +109,7 @@
                 <pre id="wucloud_log" class="wucloud-log" aria-live="polite"></pre>
 
                 <div class="wucloud-foot">
-                    <span>v0.8.0</span>
+                    <span>v0.8.1</span>
                     ·
                     <a href="https://github.com/shastitko1970-netizen/wucloud-sync" target="_blank" rel="noopener">GitHub</a>
                     · branch: main / wucloud
