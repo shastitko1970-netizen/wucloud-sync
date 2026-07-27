@@ -1,15 +1,17 @@
 <div id="wucloud-sync-panel" class="wucloud-panel">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b><i class="fa-solid fa-cloud"></i> WuCloud Sync <span class="wucloud-ver-badge">0.8.1</span></b>
+            <b><i class="fa-solid fa-cloud"></i> WuCloud Sync <span class="wucloud-ver-badge">0.8.2</span></b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content" style="display: none;">
             <div class="wucloud-settings">
                 <p class="wucloud-lead">
                     Бэкап в облако
-                    <a href="https://wuproj.com/dashboard?tab=files" target="_blank" rel="noopener">WuProj · Файлы ИИ</a>.
+                    <a href="https://wuproj.com/dashboard?tab=files" target="_blank" rel="noopener">WuProj · Файлы ИИ</a>
+                    (вкладка «Чаты» → бейдж <b>WuCloud</b>).
                     Ключ: только <b>wu-…</b> из Dashboard → API keys.
+                    Без dual-write чаты лежат как lossless blob (не как «чат сайта»).
                 </p>
                 <p class="wucloud-hint">
                     Логи мода <b>не</b> пишутся в Server log ST — смотри блок «Журнал» ниже.
@@ -91,10 +93,17 @@
                     <button id="wucloud_pull_btn" class="menu_button" type="button">
                         <i class="fa-solid fa-cloud-arrow-down"></i> Pull
                     </button>
+                    <button id="wucloud_backup_btn" class="menu_button" type="button" title="Снимок pack JSON в Dashboard → Бэкапы ST">
+                        <i class="fa-solid fa-box-archive"></i> Бэкап data
+                    </button>
                     <button id="wucloud_stop_btn" class="menu_button wucloud-stop-btn" type="button" style="display:none;" title="Остановить текущий Push">
                         <i class="fa-solid fa-stop"></i> Стоп
                     </button>
                 </div>
+                <p class="wucloud-hint">
+                    <b>Бэкап data</b> = pack персонажей/чатов через API ST (не zip диска).
+                    Полный zip папки <code>data/…</code> — на сайте вкладка <b>Бэкапы ST</b>.
+                </p>
 
                 <div id="wucloud_status" class="wucloud-status" role="status">Готов</div>
 
@@ -109,7 +118,7 @@
                 <pre id="wucloud_log" class="wucloud-log" aria-live="polite"></pre>
 
                 <div class="wucloud-foot">
-                    <span>v0.8.1</span>
+                    <span>v0.8.2</span>
                     ·
                     <a href="https://github.com/shastitko1970-netizen/wucloud-sync" target="_blank" rel="noopener">GitHub</a>
                     · branch: main / wucloud

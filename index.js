@@ -1,6 +1,7 @@
 /**
- * WuCloud Sync — SillyTavern extension v0.8.1
+ * WuCloud Sync — SillyTavern extension v0.8.2
  * Cloud backup to WuProj: characters, chats (lossless gzip blobs), personas, lorebooks, presets.
+ * + MVP st_user_backup pack (JSON asset snapshot; full disk zip → site «Бэкапы»).
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
  * Branch: main or wucloud
  */
@@ -11,7 +12,7 @@ const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.8.1';
+const EXT_VERSION = '0.8.2';
 
 /**
  * chat_push_mode:
@@ -567,6 +568,164 @@ async function pushChatPayload({ clientKey, title, jsonl }) {
     }
 
     return res;
+}
+
+/**
+ * MVP full-account pack: JSON snapshot of ST assets reachable via APIs/context.
+ * Not a raw disk zip of data/default-user — that is uploaded on the site «Бэкапы» tab.
+ * Stored as kind=st_user_backup (see Dashboard → Бэкапы ST).
+ */
+async function pushUserBackupSnapshot() {
+    if (pushInFlight) {
+        toast('warning', 'Уже идёт выгрузка');
+        return;
+    }
+    pushInFlight = true;
+    pushAbort = new AbortController();
+    setStopButtonVisible(true);
+    setStatus('Бэкап: сбор пакета…', 'busy');
+    logLine('backup: start pack (wucloud_st_pack v1)');
+
+    try {
+        const c = ctx();
+        const characters = c.characters || [];
+        const pack = {
+            version: 1,
+            format: 'wucloud_st_pack',
+            created_at: new Date().toISOString(),
+            source: 'wucloud-sync',
+            ext_version: EXT_VERSION,
+            note: 'Asset pack via SillyTavern APIs. For full data/ folder zip upload on site: Dashboard → Бэкапы ST.',
+            assets: {
+                characters: [],
+                chats: [],
+                personas: [],
+                lorebooks: [],
+                presets: [],
+            },
+        };
+
+        // Characters (metadata + data object if present; skip huge binary blobs)
+        for (let i = 0; i < characters.length; i++) {
+            if (isPushAborted()) throw new Error('Отменено');
+            const ch = characters[i];
+            pack.assets.characters.push({
+                avatar: ch.avatar,
+                name: ch.name,
+                data: ch.data || null,
+            });
+            if (i % 8 === 0) {
+                setStatus(`Бэкап: персонажи ${i + 1}/${characters.length}…`, 'busy');
+                await yieldToUI(0);
+            }
+        }
+
+        // Chats: all files we can list (cap total messages size in pack ~40MB soft)
+        let chatBytes = 0;
+        const chatSoftCap = 40 * 1024 * 1024;
+        for (let ci = 0; ci < characters.length; ci++) {
+            if (isPushAborted()) throw new Error('Отменено');
+            const char = characters[ci];
+            if (!char?.avatar) continue;
+            setStatus(`Бэкап: чаты · ${char.name || char.avatar}…`, 'busy');
+            let files = [];
+            try {
+                files = await listChatFilesForCharacter(char);
+            } catch (e) {
+                logLine(`backup list ${char.name}: ${e.message}`);
+                continue;
+            }
+            for (const f of files) {
+                if (isPushAborted()) throw new Error('Отменено');
+                if (chatBytes >= chatSoftCap) {
+                    logLine('backup: soft cap chats size — truncated');
+                    break;
+                }
+                try {
+                    const chatArr = await loadChatArray(char, f.file_name);
+                    if (!Array.isArray(chatArr) || !chatArr.length) continue;
+                    const jsonl = buildChatJsonlFromArray(chatArr, { character_name: char.name });
+                    chatBytes += jsonl.length;
+                    pack.assets.chats.push({
+                        character_avatar: char.avatar,
+                        character_name: char.name,
+                        file_name: f.file_name,
+                        jsonl,
+                    });
+                } catch (e) {
+                    logLine(`backup chat ${char.name}/${f.file_name}: ${e.message}`);
+                }
+                await yieldToUI(0);
+            }
+            if (chatBytes >= chatSoftCap) break;
+        }
+
+        // Personas / lore / presets — best effort from already implemented loaders
+        try {
+            if (typeof pushPersonas === 'function') {
+                // Collect via context power_user if available
+                const pu = c.powerUser || c.power_user || {};
+                const personas = pu.personas || pu.persona_descriptions || {};
+                if (personas && typeof personas === 'object') {
+                    pack.assets.personas = personas;
+                }
+            }
+        } catch (_) { /* ignore */ }
+
+        try {
+            const worlds = c.world_names || c.worldNames || [];
+            if (Array.isArray(worlds) && worlds.length) {
+                pack.assets.lorebooks = { names: worlds };
+            }
+        } catch (_) { /* ignore */ }
+
+        const json = JSON.stringify(pack);
+        logLine(`backup: pack ${Math.round(json.length / 1024)} KB · chars ${pack.assets.characters.length} · chats ${pack.assets.chats.length}`);
+
+        const { bytes, gzipped } = await maybeGzip(json);
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const clientKey = `st_backup:mod:${stamp}`;
+        const fd = new FormData();
+        const fname = gzipped ? `st-backup-${stamp}.json.gz` : `st-backup-${stamp}.json`;
+        fd.append('file', new Blob([bytes], { type: gzipped ? 'application/gzip' : 'application/json' }), fname);
+        fd.append('client_key', clientKey);
+        fd.append('kind', 'st_user_backup');
+        fd.append('name', `ST pack ${stamp}`);
+        fd.append('content_hash', await sha256Hex(json));
+        fd.append('meta', JSON.stringify({
+            source: 'wucloud-sync',
+            format: 'wucloud_st_pack',
+            gzipped: !!gzipped,
+            chars: pack.assets.characters.length,
+            chats: pack.assets.chats.length,
+        }));
+
+        setStatus('Бэкап: загрузка…', 'busy');
+        const res = await apiFetch('/api/v2/st-sync/blobs', { method: 'POST', formData: fd });
+        const id = res?.id;
+        logLine(res?.skipped
+            ? `backup skip unchanged #${id}`
+            : `backup OK #${id} · ${res?.size_bytes || bytes.byteLength || bytes.length} b · encoding=${res?.encoding || '?'}`);
+        setStatus(id ? `Бэкап сохранён #${id}` : 'Бэкап: ответ без id', id ? 'ok' : 'err');
+        if (id) {
+            toast('success', `Бэкап #${id} — Dashboard → Бэкапы ST`);
+        }
+        return res;
+    } catch (e) {
+        if (e?.message === 'Отменено') {
+            setStatus('Бэкап отменён', 'err');
+            logLine('backup: cancelled');
+        } else {
+            setStatus(`Бэкап: ${e.message}`, 'err');
+            toast('error', e.message);
+            logLine(`backup error: ${e.message}`);
+        }
+        throw e;
+    } finally {
+        pushInFlight = false;
+        pushAbort = null;
+        setStopButtonVisible(false);
+    }
 }
 
 async function pushCurrentChat() {
@@ -1939,6 +2098,16 @@ function bindUi() {
         syncPush({ chatMode: 'all', chatsOnly: true });
     });
     $('wucloud_push_chat_btn')?.addEventListener('click', () => syncPush({ onlyCurrentChat: true }));
+    $('wucloud_backup_btn')?.addEventListener('click', () => {
+        const ok = confirm(
+            'Собрать снимок аккаунта ST (pack JSON) в облако?\n\n'
+            + 'Это не zip всей папки data/ — для полного zip загрузите файл на сайте:\n'
+            + 'Dashboard → Бэкапы ST.\n\n'
+            + 'Большие библиотеки могут занять время (Стоп — отмена).',
+        );
+        if (!ok) return;
+        pushUserBackupSnapshot().catch(() => {});
+    });
     $('wucloud_pull_btn')?.addEventListener('click', () => syncPull({ importCharacters: true }));
     $('wucloud_stop_btn')?.addEventListener('click', () => cancelPush());
     $('wucloud_test_btn')?.addEventListener('click', () => testConnection());
@@ -1988,7 +2157,7 @@ async function init() {
     bindUi();
     bindEvents();
     setupIntervalAutosave();
-    logLine(`WuCloud Sync ${EXT_VERSION} loaded · chat_mode=${chatPushMode()} · dual=${!!getSettings().dual_write_platform}`);
+    logLine(`WuCloud Sync ${EXT_VERSION} loaded · chat_mode=${chatPushMode()} · dual=${!!getSettings().dual_write_platform} · backup=on`);
     setStatus(`Готов · WuCloud Sync ${EXT_VERSION}`, 'ok');
     toast('info', `WuCloud ${EXT_VERSION}`);
     console.log(LOG_PREFIX, `loaded v${EXT_VERSION}`);
