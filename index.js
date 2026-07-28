@@ -1,5 +1,5 @@
 /**
- * WuCloud Sync — SillyTavern extension v0.8.2
+ * WuCloud Sync — SillyTavern extension v0.8.3
  * Cloud backup to WuProj: characters, chats (lossless gzip blobs), personas, lorebooks, presets.
  * + MVP st_user_backup pack (JSON asset snapshot; full disk zip → site «Бэкапы»).
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
@@ -12,7 +12,7 @@ const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.8.2';
+const EXT_VERSION = '0.8.3';
 
 /**
  * chat_push_mode:
@@ -191,12 +191,17 @@ function stHeaders({ omitContentType = false } = {}) {
     return headers;
 }
 
-/** POST JSON to SillyTavern local API with CSRF + optional abort. */
+/**
+ * POST/GET to SillyTavern local API with CSRF + optional abort.
+ * FormData auto-omits Content-Type so browser sets multipart boundary.
+ * Missing X-CSRF-Token → ST returns 403 (classic import failure).
+ */
 async function stFetch(url, body = null, { method = 'POST', omitContentType = false } = {}) {
-    const headers = stHeaders({ omitContentType });
+    const isForm = typeof FormData !== 'undefined' && body instanceof FormData;
+    const headers = stHeaders({ omitContentType: omitContentType || isForm });
     const opts = { method, headers, cache: 'no-cache' };
     if (body != null && method !== 'GET') {
-        opts.body = typeof body === 'string' || body instanceof FormData
+        opts.body = typeof body === 'string' || isForm
             ? body
             : JSON.stringify(body);
     }
@@ -1479,7 +1484,8 @@ async function pushPresets() {
 // ─── Pull (download into ST) ──────────────────────────────────────────────
 
 async function importCharacterCardFromCloud(char) {
-    // Export cloud character as JSON → ST import API
+    // Match ST public/script.js importCharacter: FormData avatar + file_type + CSRF.
+    // Without X-CSRF-Token and file_type ST returns 403 / 400.
     const card = {
         name: char.name,
         description: char.description || '',
@@ -1509,18 +1515,22 @@ async function importCharacterCardFromCloud(char) {
             alternate_greetings: char.alternate_greetings || [],
         },
     };
-    const blob = new Blob([JSON.stringify(card)], { type: 'application/json' });
+    const safeName = String(char.name || 'card').replace(/[^\w\-]+/g, '_').slice(0, 60) || 'card';
+    const file = new File([JSON.stringify(card)], `${safeName}.json`, { type: 'application/json' });
+    const c = ctx();
     const fd = new FormData();
-    fd.append('avatar', blob, `${(char.name || 'card').replace(/[^\w\-]+/g, '_')}.json`);
-    // ST import character endpoint
-    const res = await fetch('/api/characters/import', { method: 'POST', body: fd });
+    fd.append('avatar', file);
+    fd.append('file_type', 'json');
+    fd.append('user_name', c.name1 || 'User');
+
+    const res = await stFetch('/api/characters/import', fd);
     if (!res.ok) {
-        // alternate: /api/character/import
-        const res2 = await fetch('/api/character/import', { method: 'POST', body: fd });
-        if (!res2.ok) throw new Error(`ST import failed ${res.status}/${res2.status}`);
-        return res2.json().catch(() => ({}));
+        const hint = await res.text().catch(() => '');
+        throw new Error(`ST import failed ${res.status}${hint ? `: ${hint.slice(0, 120)}` : ''} (csrf/file_type?)`);
     }
-    return res.json().catch(() => ({}));
+    const data = await res.json().catch(() => ({}));
+    if (data?.error) throw new Error(`ST import error: ${data.error}`);
+    return data;
 }
 
 async function fetchBlobText(id) {
@@ -1548,29 +1558,24 @@ function downloadJsonFile(name, obj) {
  * Save a chat jsonl into ST for a character avatar.
  * Tries common ST endpoints; falls back to browser download.
  */
-async function importChatJsonlToST(charAvatar, fileName, jsonlText) {
+async function importChatJsonlToST(charAvatar, fileName, jsonlText, characterName = 'Character') {
     const baseName = String(fileName).replace(/\.jsonl$/i, '');
-    // ST endpoint used by import chat from file
-    const attempts = [
-        { url: '/api/chats/import', body: () => {
-            const fd = new FormData();
-            fd.append('avatar_url', charAvatar);
-            fd.append('file', new Blob([jsonlText], { type: 'application/jsonl' }), `${baseName}.jsonl`);
-            return fd;
-        }},
-        { url: '/api/characters/import-chat', body: () => {
-            const fd = new FormData();
-            fd.append('avatar_url', charAvatar);
-            fd.append('file', new Blob([jsonlText], { type: 'application/jsonl' }), `${baseName}.jsonl`);
-            return fd;
-        }},
-    ];
-    for (const a of attempts) {
-        try {
-            const res = await fetch(a.url, { method: 'POST', body: a.body() });
-            if (res.ok) return { ok: true, via: a.url };
-        } catch (_) { /* try next */ }
-    }
+    const c = ctx();
+    // ST importCharacterChat: FormData avatar file + avatar_url + file_type + CSRF
+    const fd = new FormData();
+    fd.append('avatar', new File([jsonlText], `${baseName}.jsonl`, { type: 'application/jsonl' }));
+    fd.append('file_type', 'jsonl');
+    fd.append('avatar_url', charAvatar);
+    fd.append('character_name', characterName || 'Character');
+    fd.append('user_name', c.name1 || 'User');
+    try {
+        const res = await stFetch('/api/chats/import', fd);
+        if (res.ok) {
+            const data = await res.json().catch(() => ({}));
+            if (data?.res || data?.fileNames) return { ok: true, via: '/api/chats/import' };
+            if (!data?.error) return { ok: true, via: '/api/chats/import' };
+        }
+    } catch (_) { /* fallback download */ }
     // Fallback: trigger download for user to place manually
     const blob = new Blob([jsonlText], { type: 'application/jsonl' });
     const url = URL.createObjectURL(blob);
@@ -1586,41 +1591,31 @@ async function importChatJsonlToST(charAvatar, fileName, jsonlText) {
 
 async function importLorebookToST(full) {
     const name = full.name || full.Name || 'imported_lore';
-    const attempts = [
-        { url: '/api/worldinfo/import', json: true },
-        { url: '/api/worldinfo/upload', form: true },
-    ];
-    for (const a of attempts) {
-        try {
-            if (a.json) {
-                const res = await fetch(a.url, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(full),
-                });
-                if (res.ok) return { ok: true, via: a.url };
-            } else {
-                const fd = new FormData();
-                fd.append('file', new Blob([JSON.stringify(full)], { type: 'application/json' }), `${name}.json`);
-                const res = await fetch(a.url, { method: 'POST', body: fd });
-                if (res.ok) return { ok: true, via: a.url };
-            }
-        } catch (_) { /* next */ }
-    }
+    // Prefer multipart (ST worldinfo import often expects a file + CSRF)
+    try {
+        const fd = new FormData();
+        fd.append('avatar', new File([JSON.stringify(full)], `${name}.json`, { type: 'application/json' }));
+        fd.append('file_type', 'json');
+        let res = await stFetch('/api/worldinfo/import', fd);
+        if (res.ok) return { ok: true, via: '/api/worldinfo/import' };
+        res = await stFetch('/api/worldinfo/import', full);
+        if (res.ok) return { ok: true, via: '/api/worldinfo/import#json' };
+    } catch (_) { /* next */ }
     return { ok: false };
 }
 
 async function importPresetToST(preset) {
     const raw = preset.raw_data || preset;
     const name = preset.name || raw.name || 'imported_preset';
-    // Chat completion presets live in settings — try ST API
     try {
-        const res = await fetch('/api/settings/import', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(raw),
+        const res = await stFetch('/api/presets/save', {
+            name,
+            apiId: raw.apiId || raw.api_id || 'openai',
+            preset: raw,
         });
         if (res.ok) return { ok: true };
+        const res2 = await stFetch('/api/settings/import', raw);
+        if (res2.ok) return { ok: true };
     } catch (_) { /* ignore */ }
     // Download fallback
     const blob = new Blob([JSON.stringify(raw, null, 2)], { type: 'application/json' });
@@ -1686,29 +1681,39 @@ async function syncPull({ importCharacters = true } = {}) {
             } catch (_) { /* ignore */ }
         }
 
-        // Chat blobs → ST (need a character selected)
+        // Chat blobs → ST: prefer avatar from client_key (chat:avatar:filename),
+        // else selected character. Without a matching local char → download fallback.
         if (s.sync_chats && chatBlobs.length) {
-            const char = c.characters?.[c.characterId];
-            const avatar = char?.avatar;
-            if (!avatar) {
-                logLine('chats pull: выбери персонажа в ST, затем Pull снова');
-            } else {
-                for (const item of chatBlobs) {
-                    try {
-                        setStatus(`Pull chat: ${item.name}…`, 'busy');
-                        const text = await fetchBlobText(item.id);
-                        // client_key often chat:avatar:filename
-                        let fileName = item.name || `chat_${item.id}`;
-                        const parts = String(item.client_key || '').split(':');
-                        if (parts.length >= 3) fileName = parts.slice(2).join(':');
-                        const r = await importChatJsonlToST(avatar, fileName, text);
-                        if (r.ok) imported++;
-                        else { downloads++; logLine(`chat ${fileName}: saved as download`); }
-                        await mapSet(item.client_key, item.id, item.content_hash);
-                    } catch (e) {
-                        failed++;
-                        logLine(`chat blob ${item.id}: ${e.message}`);
+            const selected = c.characters?.[c.characterId];
+            const byAvatar = new Map((c.characters || []).map(ch => [String(ch.avatar || '').toLowerCase(), ch]));
+            for (const item of chatBlobs) {
+                try {
+                    setStatus(`Pull chat: ${item.name}…`, 'busy');
+                    const text = await fetchBlobText(item.id);
+                    // client_key often chat:avatar:filename
+                    let fileName = item.name || `chat_${item.id}`;
+                    let keyAvatar = '';
+                    const parts = String(item.client_key || '').split(':');
+                    if (parts[0] === 'chat' && parts.length >= 3) {
+                        keyAvatar = parts[1];
+                        fileName = parts.slice(2).join(':');
                     }
+                    const local = (keyAvatar && byAvatar.get(keyAvatar.toLowerCase()))
+                        || (selected?.avatar ? selected : null);
+                    if (!local?.avatar) {
+                        downloads++;
+                        logLine(`chat ${fileName}: нет персонажа в ST (key avatar=${keyAvatar || '?'}) — скачай JSONL вручную после импорта char`);
+                        // still offer browser download
+                        await importChatJsonlToST(keyAvatar || 'unknown.png', fileName, text, item.name || 'Character');
+                        continue;
+                    }
+                    const r = await importChatJsonlToST(local.avatar, fileName, text, local.name || 'Character');
+                    if (r.ok) imported++;
+                    else { downloads++; logLine(`chat ${fileName}: saved as download`); }
+                    await mapSet(item.client_key, item.id, item.content_hash);
+                } catch (e) {
+                    failed++;
+                    logLine(`chat blob ${item.id}: ${e.message}`);
                 }
             }
         }
