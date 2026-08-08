@@ -15,7 +15,7 @@ const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.10.7';
+const EXT_VERSION = '0.10.8';
 
 /** @typedef {'external' | 'nest'} WuCloudMode */
 
@@ -2465,10 +2465,9 @@ function looksLikeStBackup(name, type) {
 }
 
 /**
- * Nest import: read File → Blob **before any UI/await side-effects**.
- * Android Chrome revokes <input> File after toasts/DOM updates → NotReadableError
- * ("permission problems after a reference to a file was acquired").
- * Pattern: arrayBuffer() first, then upload independent Blob.
+ * Nest import: stream File to nestmgr (multi-GB).
+ * Start fetch() before any toast/DOM — keeps Android File permission for the stream
+ * and avoids loading the whole archive into RAM (arrayBuffer would OOM on phones).
  */
 async function nestImportFromFile(file) {
     if (!isNestMode()) {
@@ -2481,35 +2480,23 @@ async function nestImportFromFile(file) {
     }
     const name = String(file.name || 'backup.bin');
     const mb = (Number(file.size) || 0) / (1024 * 1024);
-    if (mb > 512) {
-        toast('error', `Архив > 512 МБ (${mb.toFixed(0)})`);
-        return;
-    }
     if (!looksLikeStBackup(name, file.type)) {
         toast('warning', `Нужен .zip / .tar.gz (выбрано: ${name})`);
         return;
     }
-    // 1) Read while OS still grants the handle — no toast/DOM before this await
-    let body;
+    // Kick off stream immediately (same turn as <input> change as much as possible)
+    const upload = fetch('/_nest/import', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: file,
+    });
+    const sizeLabel = mb >= 1024 ? `${(mb / 1024).toFixed(2)} ГБ` : `${mb.toFixed(1)} МБ`;
+    setStatus(`Import: ${name} (${sizeLabel})…`, 'busy');
+    toast('info', `Загрузка ${name} (${sizeLabel})…`);
+    logLine(`import start name=${name} size_mb=${mb.toFixed(2)}`);
     try {
-        body = new Blob([await file.arrayBuffer()], { type: 'application/octet-stream' });
-    } catch (e) {
-        const msg = e?.message || String(e);
-        toast('error', msg);
-        logLine(`import read: ${msg}`);
-        return;
-    }
-    // 2) Safe: Blob is in-memory, input may be cleared / UI may re-render
-    try {
-        setStatus(`Import: ${name} (${mb.toFixed(1)} МБ)…`, 'busy');
-        toast('info', `Загрузка ${name}…`);
-        logLine(`import start name=${name} size_mb=${mb.toFixed(2)}`);
-        const res = await fetch('/_nest/import', {
-            method: 'POST',
-            credentials: 'include',
-            headers: { 'Content-Type': 'application/octet-stream' },
-            body,
-        });
+        const res = await upload;
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
             const hint = data.error || `HTTP ${res.status}`;
