@@ -15,7 +15,7 @@ const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.10.6'; // keep in sync with manifest + settings.html badge
+const EXT_VERSION = '0.10.7';
 
 /** @typedef {'external' | 'nest'} WuCloudMode */
 
@@ -2455,68 +2455,71 @@ async function nestExportZip() {
     }
 }
 
-/** True for ST user backups: .zip (desktop) or .tar.gz (Android ST / some apps). */
-function looksLikeStBackup(file) {
-    const n = String(file?.name || '').toLowerCase();
-    const t = String(file?.type || '').toLowerCase();
-    if (n.endsWith('.zip') || n.endsWith('.tar.gz') || n.endsWith('.tgz') || n.endsWith('.tar')) return true;
-    if (t.includes('zip') || t.includes('gzip') || t.includes('tar') || t.includes('compressed')) return true;
-    // Android often reports empty / octet-stream — allow; server checks magic bytes
-    if (t === 'application/octet-stream' || t === '') return true;
-    return false;
+/** ST backup name/type: zip (desktop) or tar.gz (Android ST). Server also sniffs magic. */
+function looksLikeStBackup(name, type) {
+    const n = String(name || '').toLowerCase();
+    const t = String(type || '').toLowerCase();
+    return n.endsWith('.zip') || n.endsWith('.tar.gz') || n.endsWith('.tgz') || n.endsWith('.tar')
+        || t.includes('zip') || t.includes('gzip') || t.includes('tar') || t.includes('compressed')
+        || t === 'application/octet-stream' || t === '';
 }
 
-/** Import: archive body → nestmgr extracts into data/wu-* (refresh ST after).
- *  Pass File/Blob as body (NOT arrayBuffer) — mobile OOMs on big backups.
- *  Formats: zip (desktop ST) + tar.gz (Android ST).
+/**
+ * Nest import: read File → Blob **before any UI/await side-effects**.
+ * Android Chrome revokes <input> File after toasts/DOM updates → NotReadableError
+ * ("permission problems after a reference to a file was acquired").
+ * Pattern: arrayBuffer() first, then upload independent Blob.
  */
-async function nestImportZip(file) {
-    if (!file) {
-        toast('warning', 'Файл не выбран');
+async function nestImportFromFile(file) {
+    if (!isNestMode()) {
+        toast('warning', 'Import только на Nest');
         return;
     }
-    if (!isNestMode()) {
-        toast('warning', 'Import только на Nest (nest.wuproj.com)');
-        logLine('import: not nest mode');
+    if (!file) {
+        toast('warning', 'Файл не выбран');
         return;
     }
     const name = String(file.name || 'backup.bin');
     const mb = (Number(file.size) || 0) / (1024 * 1024);
     if (mb > 512) {
-        toast('error', `Архив слишком большой (${mb.toFixed(0)} МБ, max 512)`);
+        toast('error', `Архив > 512 МБ (${mb.toFixed(0)})`);
         return;
     }
-    if (!looksLikeStBackup(file)) {
-        toast('warning', `Нужен бэкап ST: .zip или .tar.gz (выбрано: ${name})`);
-        logLine(`import: reject name=${name} type=${file.type || '?'}`);
+    if (!looksLikeStBackup(name, file.type)) {
+        toast('warning', `Нужен .zip / .tar.gz (выбрано: ${name})`);
         return;
     }
+    // 1) Read while OS still grants the handle — no toast/DOM before this await
+    let body;
+    try {
+        body = new Blob([await file.arrayBuffer()], { type: 'application/octet-stream' });
+    } catch (e) {
+        const msg = e?.message || String(e);
+        toast('error', msg);
+        logLine(`import read: ${msg}`);
+        return;
+    }
+    // 2) Safe: Blob is in-memory, input may be cleared / UI may re-render
     try {
         setStatus(`Import: ${name} (${mb.toFixed(1)} МБ)…`, 'busy');
         toast('info', `Загрузка ${name}…`);
-        logLine(`import start name=${name} size_mb=${mb.toFixed(2)} type=${file.type || '?'}`);
-        // Keep File attached to <input> for the whole request (Android permission).
-        // Do not clear input / call file.value='' until this fetch settles.
+        logLine(`import start name=${name} size_mb=${mb.toFixed(2)}`);
         const res = await fetch('/_nest/import', {
             method: 'POST',
             credentials: 'include',
             headers: { 'Content-Type': 'application/octet-stream' },
-            body: file,
+            body,
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
             const hint = data.error || `HTTP ${res.status}`;
-            if (res.status === 401) throw new Error(`${hint} — войдите снова (cookie)`);
-            if (res.status === 413) throw new Error('Файл слишком большой для прокси');
-            throw new Error(hint);
+            throw new Error(res.status === 401 ? `${hint} — войдите снова` : hint);
         }
         setStatus(`Import: ${data.files || 0} files (${data.format || '?'}) → ${data.handle}`, 'ok');
-        toast('success', 'Импорт готов — страница перезагрузится');
-        logLine(`import ok files=${data.files} format=${data.format} handle=${data.handle}`);
+        toast('success', 'Импорт готов — reload');
+        logLine(`import ok files=${data.files} format=${data.format}`);
         refreshNestUsage();
-        setTimeout(() => {
-            try { location.reload(); } catch (_) { /* ignore */ }
-        }, 1200);
+        setTimeout(() => { try { location.reload(); } catch (_) { /* */ } }, 1200);
     } catch (e) {
         const msg = e?.message || String(e);
         setStatus(`Import: ${msg}`, 'err');
@@ -2556,11 +2559,7 @@ function applyManagedUi() {
     }
 }
 
-/** Bind Nest export/import — idempotent.
- *  Import uses <label for=file> + full-size transparent overlay input (see settings.html).
- *  Do NOT call input.click() from a button — Android/Chrome often ignore synthetic
- *  open or grey-out files when accept= is set. No accept filter; validate in JS.
- */
+/** Bind Nest export/import. Label+overlay input only (no synthetic click). */
 function wireNestImportExport() {
     const exp = document.getElementById('wucloud_nest_export');
     const file = document.getElementById('wucloud_nest_import_file');
@@ -2573,35 +2572,19 @@ function wireNestImportExport() {
     }
     if (file && !file.dataset.bound) {
         file.dataset.bound = '1';
-        // Explicitly clear accept — leftover attribute greys zips on Android
-        try {
-            file.removeAttribute('accept');
-            file.accept = '';
-        } catch (_) { /* ignore */ }
-        let pickLock = false;
-        const onPick = () => {
-            if (pickLock) return;
+        try { file.removeAttribute('accept'); } catch (_) { /* */ }
+        let busy = false;
+        file.addEventListener('change', () => {
+            if (busy) return;
             const f = file.files && file.files[0];
             if (!f) return;
-            pickLock = true;
-            // CRITICAL (Android/Chrome): never clear input before fetch finishes.
-            // file.value='' revokes the File → NotReadableError:
-            // "The requested file could not be read, typically due to permission..."
-            if (!looksLikeStBackup(f)) {
-                toast('warning', `Нужен бэкап ST: .zip или .tar.gz (выбрано: ${f.name || f.type || 'file'})`);
-                logLine(`import: reject name=${f.name} type=${f.type || '?'}`);
-                pickLock = false;
-                return;
-            }
-            Promise.resolve(nestImportZip(f))
-                .finally(() => {
-                    try { file.value = ''; } catch (_) { /* ignore */ }
-                    pickLock = false;
-                });
-        };
-        file.addEventListener('change', onPick);
-        // Some Android WebViews fire input instead of / with change
-        file.addEventListener('input', onPick);
+            busy = true;
+            // Read first (inside change chain), then clear — see nestImportFromFile
+            nestImportFromFile(f).finally(() => {
+                try { file.value = ''; } catch (_) { /* */ }
+                busy = false;
+            });
+        });
     }
 }
 
