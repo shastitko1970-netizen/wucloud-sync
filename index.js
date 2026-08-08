@@ -15,7 +15,7 @@ const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.10.8';
+const EXT_VERSION = '0.10.9';
 
 /** @typedef {'external' | 'nest'} WuCloudMode */
 
@@ -2464,10 +2464,12 @@ function looksLikeStBackup(name, type) {
         || t === 'application/octet-stream' || t === '';
 }
 
+/** CF free/pro kills single POST >~100MB → "Failed to fetch". Chunk under that. */
+const NEST_IMPORT_CHUNK = 48 * 1024 * 1024;
+
 /**
- * Nest import: stream File to nestmgr (multi-GB).
- * Start fetch() before any toast/DOM — keeps Android File permission for the stream
- * and avoids loading the whole archive into RAM (arrayBuffer would OOM on phones).
+ * Nest import: multi-GB via sequential chunks (each < CF limit).
+ * Slice all parts before any await so Android File stays valid.
  */
 async function nestImportFromFile(file) {
     if (!isNestMode()) {
@@ -2479,32 +2481,53 @@ async function nestImportFromFile(file) {
         return;
     }
     const name = String(file.name || 'backup.bin');
-    const mb = (Number(file.size) || 0) / (1024 * 1024);
+    const size = Number(file.size) || 0;
+    const mb = size / (1024 * 1024);
     if (!looksLikeStBackup(name, file.type)) {
         toast('warning', `Нужен .zip / .tar.gz (выбрано: ${name})`);
         return;
     }
-    // Kick off stream immediately (same turn as <input> change as much as possible)
-    const upload = fetch('/_nest/import', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: file,
-    });
+    const chunks = Math.max(1, Math.ceil(size / NEST_IMPORT_CHUNK) || 1);
+    // Prepare Blob slices BEFORE any await (Android File permission)
+    const parts = [];
+    for (let i = 0; i < chunks; i++) {
+        parts.push(file.slice(i * NEST_IMPORT_CHUNK, Math.min(size, (i + 1) * NEST_IMPORT_CHUNK)));
+    }
+    const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : `u${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
     const sizeLabel = mb >= 1024 ? `${(mb / 1024).toFixed(2)} ГБ` : `${mb.toFixed(1)} МБ`;
-    setStatus(`Import: ${name} (${sizeLabel})…`, 'busy');
+    setStatus(`Import: ${name} (${sizeLabel}, 1/${chunks})…`, 'busy');
     toast('info', `Загрузка ${name} (${sizeLabel})…`);
-    logLine(`import start name=${name} size_mb=${mb.toFixed(2)}`);
+    logLine(`import start name=${name} size_mb=${mb.toFixed(2)} chunks=${chunks}`);
     try {
-        const res = await upload;
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-            const hint = data.error || `HTTP ${res.status}`;
-            throw new Error(res.status === 401 ? `${hint} — войдите снова` : hint);
+        let data = {};
+        for (let i = 0; i < chunks; i++) {
+            setStatus(`Import: ${name} · ${i + 1}/${chunks}…`, 'busy');
+            logLine(`import chunk ${i + 1}/${chunks}`);
+            const res = await fetch('/_nest/import', {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                    'Content-Type': 'application/octet-stream',
+                    'X-Nest-Upload-Id': id,
+                    'X-Nest-Chunk': String(i),
+                    'X-Nest-Chunks': String(chunks),
+                },
+                body: parts[i],
+            });
+            data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                const hint = data.error || `HTTP ${res.status}`;
+                throw new Error(res.status === 401 ? `${hint} — войдите снова` : hint);
+            }
+        }
+        if (!data.done && data.files == null) {
+            throw new Error(data.error || 'upload incomplete');
         }
         setStatus(`Import: ${data.files || 0} files (${data.format || '?'}) → ${data.handle}`, 'ok');
         toast('success', 'Импорт готов — reload');
-        logLine(`import ok files=${data.files} format=${data.format}`);
+        logLine(`import ok files=${data.files} format=${data.format} chunks=${chunks}`);
         refreshNestUsage();
         setTimeout(() => { try { location.reload(); } catch (_) { /* */ } }, 1200);
     } catch (e) {
