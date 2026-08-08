@@ -15,7 +15,7 @@ const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.10.4'; // keep in sync with manifest + settings.html badge
+const EXT_VERSION = '0.10.5'; // keep in sync with manifest + settings.html badge
 
 /** @typedef {'external' | 'nest'} WuCloudMode */
 
@@ -2455,9 +2455,20 @@ async function nestExportZip() {
     }
 }
 
-/** Import: raw zip → nestmgr extracts into data/wu-* (refresh ST after).
- *  Pass File/Blob as body (NOT arrayBuffer) — mobile OOMs/hangs on big backups
- *  if we load the whole zip into RAM first → looks like “file picker then nothing”.
+/** True for ST user backups: .zip (desktop) or .tar.gz (Android ST / some apps). */
+function looksLikeStBackup(file) {
+    const n = String(file?.name || '').toLowerCase();
+    const t = String(file?.type || '').toLowerCase();
+    if (n.endsWith('.zip') || n.endsWith('.tar.gz') || n.endsWith('.tgz') || n.endsWith('.tar')) return true;
+    if (t.includes('zip') || t.includes('gzip') || t.includes('tar') || t.includes('compressed')) return true;
+    // Android often reports empty / octet-stream — allow; server checks magic bytes
+    if (t === 'application/octet-stream' || t === '') return true;
+    return false;
+}
+
+/** Import: archive body → nestmgr extracts into data/wu-* (refresh ST after).
+ *  Pass File/Blob as body (NOT arrayBuffer) — mobile OOMs on big backups.
+ *  Formats: zip (desktop ST) + tar.gz (Android ST).
  */
 async function nestImportZip(file) {
     if (!file) {
@@ -2465,25 +2476,30 @@ async function nestImportZip(file) {
         return;
     }
     if (!isNestMode()) {
-        toast('warning', 'Import zip только на Nest (nest.wuproj.com)');
+        toast('warning', 'Import только на Nest (nest.wuproj.com)');
         logLine('import: not nest mode');
         return;
     }
-    const name = String(file.name || 'backup.zip');
+    const name = String(file.name || 'backup.bin');
     const mb = (Number(file.size) || 0) / (1024 * 1024);
     if (mb > 512) {
-        toast('error', `Zip слишком большой (${mb.toFixed(0)} МБ, max 512)`);
+        toast('error', `Архив слишком большой (${mb.toFixed(0)} МБ, max 512)`);
+        return;
+    }
+    if (!looksLikeStBackup(file)) {
+        toast('warning', `Нужен бэкап ST: .zip или .tar.gz (выбрано: ${name})`);
+        logLine(`import: reject name=${name} type=${file.type || '?'}`);
         return;
     }
     try {
         setStatus(`Import: ${name} (${mb.toFixed(1)} МБ)…`, 'busy');
         toast('info', `Загрузка ${name}…`);
         logLine(`import start name=${name} size_mb=${mb.toFixed(2)} type=${file.type || '?'}`);
-        // File is a Blob — browser streams + sets Content-Length. No full RAM buffer.
+        // Stream File; server sniffs PK vs gzip magic (do not force application/zip)
         const res = await fetch('/_nest/import', {
             method: 'POST',
             credentials: 'include',
-            headers: { 'Content-Type': 'application/zip' },
+            headers: { 'Content-Type': 'application/octet-stream' },
             body: file,
         });
         const data = await res.json().catch(() => ({}));
@@ -2493,9 +2509,9 @@ async function nestImportZip(file) {
             if (res.status === 413) throw new Error('Файл слишком большой для прокси');
             throw new Error(hint);
         }
-        setStatus(`Import: ${data.files || 0} files → ${data.handle}`, 'ok');
+        setStatus(`Import: ${data.files || 0} files (${data.format || '?'}) → ${data.handle}`, 'ok');
         toast('success', 'Импорт готов — страница перезагрузится');
-        logLine(`import ok files=${data.files} handle=${data.handle}`);
+        logLine(`import ok files=${data.files} format=${data.format} handle=${data.handle}`);
         refreshNestUsage();
         setTimeout(() => {
             try { location.reload(); } catch (_) { /* ignore */ }
@@ -2568,15 +2584,9 @@ function wireNestImportExport() {
             if (!f) return;
             pickLock = true;
             try { file.value = ''; } catch (_) { /* ignore */ }
-            const n = String(f.name || '').toLowerCase();
-            const t = String(f.type || '').toLowerCase();
-            const looksZip = n.endsWith('.zip')
-                || t.includes('zip')
-                || t === 'application/octet-stream'
-                || t === '';
-            if (!looksZip) {
-                toast('warning', `Нужен .zip бэкап ST (выбрано: ${f.name || t || 'file'})`);
-                logLine(`import: reject non-zip name=${f.name} type=${t}`);
+            if (!looksLikeStBackup(f)) {
+                toast('warning', `Нужен бэкап ST: .zip или .tar.gz (выбрано: ${f.name || f.type || 'file'})`);
+                logLine(`import: reject name=${f.name} type=${f.type || '?'}`);
                 pickLock = false;
                 return;
             }

@@ -1,7 +1,7 @@
 <div id="wucloud-sync-panel" class="wucloud-panel">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b><i class="fa-solid fa-cloud"></i> WuCloud <span class="wucloud-ver-badge" id="wucloud_ver_badge">0.10.4</span>
+            <b><i class="fa-solid fa-cloud"></i> WuCloud <span class="wucloud-ver-badge" id="wucloud_ver_badge">0.10.5</span>
                 <span id="wucloud_mode_badge" class="wucloud-mode-badge">…</span></b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
@@ -27,8 +27,8 @@
                         <!-- Android: never use button→input.click(). Label/for or overlay input is required
                              so the tap is a real user gesture on <input type=file>. No accept= filter —
                              Android often marks .zip as application/octet-stream and greys them out. -->
-                        <label id="wucloud_nest_import" class="menu_button wucloud-file-label" for="wucloud_nest_import_file" title="Распаковать ST backup zip в ваш data/wu-*">
-                            <i class="fa-solid fa-file-import"></i> Import zip
+                        <label id="wucloud_nest_import" class="menu_button wucloud-file-label" for="wucloud_nest_import_file" title="Распаковать ST backup (.zip или .tar.gz) в data/wu-*">
+                            <i class="fa-solid fa-file-import"></i> Import
                             <input type="file" id="wucloud_nest_import_file" class="wucloud-file-input" />
                         </label>
                     </div>
@@ -38,10 +38,8 @@
                         <a href="https://wuproj.com/gold" target="_blank" rel="noopener">wu-gold</a>
                     </div>
                     <p class="wucloud-hint" style="margin-top:8px">
-                        Export = ST <code>/api/users/backup</code> (файл .zip).
-                        Import: выберите <b>файл</b> <code>*.zip</code>, не папку.
-                        На Android, если zip «серый» — Files → «Все файлы» / «Показать все».
-                        После импорта страница перезагрузится.
+                        Export = ST <code>.zip</code>. Import принимает <b>.zip</b> (ПК) и <b>.tar.gz</b> (Android ST).
+                        Нужен <b>файл</b>, не папка. После импорта — reload.
                     </p>
                 </div>
 
@@ -114,7 +112,7 @@
                 <pre id="wucloud_log" class="wucloud-log" aria-live="polite"></pre>
 
                 <div class="wucloud-foot">
-                    <span id="wucloud_ver_foot">v0.10.4 · Phase 2 packs</span>
+                    <span id="wucloud_ver_foot">v0.10.5 · Phase 2 packs</span>
                     ·
                     <a href="https://github.com/shastitko1970-netizen/wucloud-sync" target="_blank" rel="noopener">GitHub</a>
                     ·
