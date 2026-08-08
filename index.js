@@ -15,7 +15,7 @@ const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.10.5'; // keep in sync with manifest + settings.html badge
+const EXT_VERSION = '0.10.6'; // keep in sync with manifest + settings.html badge
 
 /** @typedef {'external' | 'nest'} WuCloudMode */
 
@@ -2495,7 +2495,8 @@ async function nestImportZip(file) {
         setStatus(`Import: ${name} (${mb.toFixed(1)} МБ)…`, 'busy');
         toast('info', `Загрузка ${name}…`);
         logLine(`import start name=${name} size_mb=${mb.toFixed(2)} type=${file.type || '?'}`);
-        // Stream File; server sniffs PK vs gzip magic (do not force application/zip)
+        // Keep File attached to <input> for the whole request (Android permission).
+        // Do not clear input / call file.value='' until this fetch settles.
         const res = await fetch('/_nest/import', {
             method: 'POST',
             credentials: 'include',
@@ -2583,14 +2584,20 @@ function wireNestImportExport() {
             const f = file.files && file.files[0];
             if (!f) return;
             pickLock = true;
-            try { file.value = ''; } catch (_) { /* ignore */ }
+            // CRITICAL (Android/Chrome): never clear input before fetch finishes.
+            // file.value='' revokes the File → NotReadableError:
+            // "The requested file could not be read, typically due to permission..."
             if (!looksLikeStBackup(f)) {
                 toast('warning', `Нужен бэкап ST: .zip или .tar.gz (выбрано: ${f.name || f.type || 'file'})`);
                 logLine(`import: reject name=${f.name} type=${f.type || '?'}`);
                 pickLock = false;
                 return;
             }
-            Promise.resolve(nestImportZip(f)).finally(() => { pickLock = false; });
+            Promise.resolve(nestImportZip(f))
+                .finally(() => {
+                    try { file.value = ''; } catch (_) { /* ignore */ }
+                    pickLock = false;
+                });
         };
         file.addEventListener('change', onPick);
         // Some Android WebViews fire input instead of / with change
