@@ -1,18 +1,23 @@
 /**
- * WuCloud Sync — SillyTavern extension v0.8.3
- * Cloud backup to WuProj: characters, chats (lossless gzip blobs), personas, lorebooks, presets.
- * + MVP st_user_backup pack (JSON asset snapshot; full disk zip → site «Бэкапы»).
+ * WuCloud — SillyTavern extension v0.10 (Phase 2 packs)
+ *
+ * Two modes (see docs/WUCLOUD.md):
+ *   external  — bridge: local/foreign ST ↔ WuApi packs (zip object store)
+ *   nest      — companion on nest.wuproj.com: live data is ST disk only; NO cloud Push/Pull
+ *
+ * Phase 2: Push/Pull = full ST data pack, not dual-model component blobs.
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
- * Branch: main or wucloud
  */
 import { getContext, extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
-import { saveSettingsDebounced } from '../../../../script.js';
+import { getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
 
 const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.8.3';
+const EXT_VERSION = '0.10.4'; // keep in sync with manifest + settings.html badge
+
+/** @typedef {'external' | 'nest'} WuCloudMode */
 
 /**
  * chat_push_mode:
@@ -29,13 +34,15 @@ const defaultSettings = Object.freeze({
     sync_personas: true,
     sync_lorebooks: true,
     sync_presets: true,
-    autosave: 'off', // off | message | interval
+    autosave: 'off', // off | message | interval — forced off on Nest
     debounce_sec: 8,
     use_gzip: true,
     chat_push_mode: 'current', // current | character | all
     // Dual-write to platform /chats for Dashboard preview. Heavy — off by default.
     dual_write_platform: false,
     request_timeout_sec: 90,
+    // Phase 0: set true on nest.wuproj.com (companion mode)
+    managed_nest: false,
 });
 
 /** @type {Record<string, { cloud_id?: number, content_hash?: string }>} */
@@ -576,11 +583,11 @@ async function pushChatPayload({ clientKey, title, jsonl }) {
 }
 
 /**
- * MVP full-account pack: JSON snapshot of ST assets reachable via APIs/context.
- * Not a raw disk zip of data/default-user — that is uploaded on the site «Бэкапы» tab.
- * Stored as kind=st_user_backup (see Dashboard → Бэкапы ST).
+ * Phase 2: push one ST data pack to object store (/api/v2/wucloud/packs).
+ * Prefer ST native zip via /api/users/backup; fallback JSON asset pack.
  */
-async function pushUserBackupSnapshot() {
+async function pushPackToCloud() {
+    if (!assertExternalBridge('Push pack')) return;
     if (pushInFlight) {
         toast('warning', 'Уже идёт выгрузка');
         return;
@@ -588,148 +595,245 @@ async function pushUserBackupSnapshot() {
     pushInFlight = true;
     pushAbort = new AbortController();
     setStopButtonVisible(true);
-    setStatus('Бэкап: сбор пакета…', 'busy');
-    logLine('backup: start pack (wucloud_st_pack v1)');
+    setStatus('Push pack…', 'busy');
+    logLine('pack push: start');
 
     try {
-        const c = ctx();
-        const characters = c.characters || [];
-        const pack = {
-            version: 1,
-            format: 'wucloud_st_pack',
-            created_at: new Date().toISOString(),
-            source: 'wucloud-sync',
-            ext_version: EXT_VERSION,
-            note: 'Asset pack via SillyTavern APIs. For full data/ folder zip upload on site: Dashboard → Бэкапы ST.',
-            assets: {
-                characters: [],
-                chats: [],
-                personas: [],
-                lorebooks: [],
-                presets: [],
-            },
-        };
+        let blob = null;
+        let filename = '';
+        let format = 'zip';
 
-        // Characters (metadata + data object if present; skip huge binary blobs)
-        for (let i = 0; i < characters.length; i++) {
-            if (isPushAborted()) throw new Error('Отменено');
-            const ch = characters[i];
-            pack.assets.characters.push({
-                avatar: ch.avatar,
-                name: ch.name,
-                data: ch.data || null,
-            });
-            if (i % 8 === 0) {
-                setStatus(`Бэкап: персонажи ${i + 1}/${characters.length}…`, 'busy');
-                await yieldToUI(0);
-            }
-        }
-
-        // Chats: all files we can list (cap total messages size in pack ~40MB soft)
-        let chatBytes = 0;
-        const chatSoftCap = 40 * 1024 * 1024;
-        for (let ci = 0; ci < characters.length; ci++) {
-            if (isPushAborted()) throw new Error('Отменено');
-            const char = characters[ci];
-            if (!char?.avatar) continue;
-            setStatus(`Бэкап: чаты · ${char.name || char.avatar}…`, 'busy');
-            let files = [];
-            try {
-                files = await listChatFilesForCharacter(char);
-            } catch (e) {
-                logLine(`backup list ${char.name}: ${e.message}`);
-                continue;
-            }
-            for (const f of files) {
-                if (isPushAborted()) throw new Error('Отменено');
-                if (chatBytes >= chatSoftCap) {
-                    logLine('backup: soft cap chats size — truncated');
-                    break;
-                }
-                try {
-                    const chatArr = await loadChatArray(char, f.file_name);
-                    if (!Array.isArray(chatArr) || !chatArr.length) continue;
-                    const jsonl = buildChatJsonlFromArray(chatArr, { character_name: char.name });
-                    chatBytes += jsonl.length;
-                    pack.assets.chats.push({
-                        character_avatar: char.avatar,
-                        character_name: char.name,
-                        file_name: f.file_name,
-                        jsonl,
+        // 1) ST native backup zip (multi-user or default handle)
+        try {
+            setStatus('Push: ST backup zip…', 'busy');
+            const meRes = await fetch('/api/users/me', { headers: getRequestHeaders() });
+            if (meRes.ok) {
+                const me = await meRes.json();
+                const handle = me.handle || me.name || '';
+                if (handle) {
+                    const res = await fetch('/api/users/backup', {
+                        method: 'POST',
+                        headers: getRequestHeaders(),
+                        body: JSON.stringify({ handle }),
+                        signal: pushAbort?.signal,
                     });
-                } catch (e) {
-                    logLine(`backup chat ${char.name}/${f.file_name}: ${e.message}`);
+                    if (res.ok) {
+                        blob = await res.blob();
+                        const cd = res.headers.get('Content-Disposition') || '';
+                        const m = /filename="?([^";]+)"?/i.exec(cd);
+                        filename = (m && m[1]) || `${handle}-backup.zip`;
+                        format = 'zip';
+                        logLine(`pack push: ST zip ${Math.round(blob.size / 1024)} KB`);
+                    } else {
+                        logLine(`pack push: ST backup HTTP ${res.status} — JSON fallback`);
+                    }
                 }
-                await yieldToUI(0);
+            } else {
+                logLine(`pack push: /api/users/me ${meRes.status} — JSON fallback`);
             }
-            if (chatBytes >= chatSoftCap) break;
+        } catch (e) {
+            if (e?.name === 'AbortError' || e?.message === 'Отменено') throw new Error('Отменено');
+            logLine(`pack push: ST zip fail ${e.message} — JSON fallback`);
         }
 
-        // Personas / lore / presets — best effort from already implemented loaders
-        try {
-            if (typeof pushPersonas === 'function') {
-                // Collect via context power_user if available
-                const pu = c.powerUser || c.power_user || {};
-                const personas = pu.personas || pu.persona_descriptions || {};
-                if (personas && typeof personas === 'object') {
-                    pack.assets.personas = personas;
-                }
-            }
-        } catch (_) { /* ignore */ }
+        // 2) JSON asset pack fallback (no multi-user backup)
+        if (!blob) {
+            setStatus('Push: JSON pack…', 'busy');
+            const json = await buildJsonAssetPack();
+            const { bytes, gzipped } = await maybeGzip(json);
+            blob = new Blob([bytes], { type: gzipped ? 'application/gzip' : 'application/json' });
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            filename = gzipped ? `st-pack-${stamp}.json.gz` : `st-pack-${stamp}.json`;
+            format = gzipped ? 'json.gz' : 'json';
+            logLine(`pack push: JSON ${Math.round(blob.size / 1024)} KB`);
+        }
 
-        try {
-            const worlds = c.world_names || c.worldNames || [];
-            if (Array.isArray(worlds) && worlds.length) {
-                pack.assets.lorebooks = { names: worlds };
-            }
-        } catch (_) { /* ignore */ }
+        if (isPushAborted()) throw new Error('Отменено');
 
-        const json = JSON.stringify(pack);
-        logLine(`backup: pack ${Math.round(json.length / 1024)} KB · chars ${pack.assets.characters.length} · chats ${pack.assets.chats.length}`);
-
-        const { bytes, gzipped } = await maybeGzip(json);
+        const ab = await blob.arrayBuffer();
+        const hash = await sha256Hex(ab);
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        const clientKey = `st_backup:mod:${stamp}`;
+        const clientKey = `pack:mod:${stamp}`;
         const fd = new FormData();
-        const fname = gzipped ? `st-backup-${stamp}.json.gz` : `st-backup-${stamp}.json`;
-        fd.append('file', new Blob([bytes], { type: gzipped ? 'application/gzip' : 'application/json' }), fname);
+        fd.append('file', blob, filename || `pack-${stamp}.bin`);
         fd.append('client_key', clientKey);
-        fd.append('kind', 'st_user_backup');
-        fd.append('name', `ST pack ${stamp}`);
-        fd.append('content_hash', await sha256Hex(json));
+        fd.append('name', filename || `ST pack ${stamp}`);
+        fd.append('content_hash', hash);
+        fd.append('source', 'mod');
         fd.append('meta', JSON.stringify({
             source: 'wucloud-sync',
-            format: 'wucloud_st_pack',
-            gzipped: !!gzipped,
-            chars: pack.assets.characters.length,
-            chats: pack.assets.chats.length,
+            format,
+            ext_version: EXT_VERSION,
         }));
 
-        setStatus('Бэкап: загрузка…', 'busy');
-        const res = await apiFetch('/api/v2/st-sync/blobs', { method: 'POST', formData: fd });
+        setStatus('Push: upload…', 'busy');
+        const res = await apiFetch('/api/v2/wucloud/packs', { method: 'POST', formData: fd });
         const id = res?.id;
         logLine(res?.skipped
-            ? `backup skip unchanged #${id}`
-            : `backup OK #${id} · ${res?.size_bytes || bytes.byteLength || bytes.length} b · encoding=${res?.encoding || '?'}`);
-        setStatus(id ? `Бэкап сохранён #${id}` : 'Бэкап: ответ без id', id ? 'ok' : 'err');
-        if (id) {
-            toast('success', `Бэкап #${id} — Dashboard → Бэкапы ST`);
-        }
+            ? `pack skip unchanged #${id}`
+            : `pack OK #${id} · ${res?.size_bytes || blob.size} b · ${res?.encoding || format}`);
+        setStatus(id ? `Pack #${id} в облаке` : 'Push: нет id', id ? 'ok' : 'err');
+        if (id) toast('success', `Pack #${id} — Dashboard → WuCloud packs`);
         return res;
     } catch (e) {
         if (e?.message === 'Отменено') {
-            setStatus('Бэкап отменён', 'err');
-            logLine('backup: cancelled');
+            setStatus('Push отменён', 'err');
+            logLine('pack push: cancelled');
         } else {
-            setStatus(`Бэкап: ${e.message}`, 'err');
+            setStatus(`Push: ${e.message}`, 'err');
             toast('error', e.message);
-            logLine(`backup error: ${e.message}`);
+            logLine(`pack push error: ${e.message}`);
         }
         throw e;
     } finally {
         pushInFlight = false;
         pushAbort = null;
         setStopButtonVisible(false);
+    }
+}
+
+/** Build lightweight JSON asset pack when ST zip backup is unavailable. */
+async function buildJsonAssetPack() {
+    const c = ctx();
+    const characters = c.characters || [];
+    const pack = {
+        version: 1,
+        format: 'wucloud_st_pack',
+        created_at: new Date().toISOString(),
+        source: 'wucloud-sync',
+        ext_version: EXT_VERSION,
+        note: 'JSON asset pack fallback. Prefer ST /api/users/backup zip when available.',
+        assets: { characters: [], chats: [], personas: {}, lorebooks: {}, presets: [] },
+    };
+    for (let i = 0; i < characters.length; i++) {
+        if (isPushAborted()) throw new Error('Отменено');
+        const ch = characters[i];
+        pack.assets.characters.push({ avatar: ch.avatar, name: ch.name, data: ch.data || null });
+        if (i % 8 === 0) {
+            setStatus(`Pack: chars ${i + 1}/${characters.length}…`, 'busy');
+            await yieldToUI(0);
+        }
+    }
+    let chatBytes = 0;
+    const chatSoftCap = 40 * 1024 * 1024;
+    for (let ci = 0; ci < characters.length; ci++) {
+        if (isPushAborted()) throw new Error('Отменено');
+        const char = characters[ci];
+        if (!char?.avatar) continue;
+        let files = [];
+        try { files = await listChatFilesForCharacter(char); } catch (_) { continue; }
+        for (const f of files) {
+            if (isPushAborted()) throw new Error('Отменено');
+            if (chatBytes >= chatSoftCap) break;
+            try {
+                const chatArr = await loadChatArray(char, f.file_name);
+                if (!Array.isArray(chatArr) || !chatArr.length) continue;
+                const jsonl = buildChatJsonlFromArray(chatArr, { character_name: char.name });
+                chatBytes += jsonl.length;
+                pack.assets.chats.push({
+                    character_avatar: char.avatar,
+                    character_name: char.name,
+                    file_name: f.file_name,
+                    jsonl,
+                });
+            } catch (_) { /* skip */ }
+            await yieldToUI(0);
+        }
+        if (chatBytes >= chatSoftCap) break;
+    }
+    try {
+        const pu = c.powerUser || c.power_user || {};
+        pack.assets.personas = pu.personas || pu.persona_descriptions || {};
+    } catch (_) { /* ignore */ }
+    try {
+        const worlds = c.world_names || c.worldNames || [];
+        if (Array.isArray(worlds)) pack.assets.lorebooks = { names: worlds };
+    } catch (_) { /* ignore */ }
+    return JSON.stringify(pack);
+}
+
+/** @deprecated alias */
+async function pushUserBackupSnapshot() {
+    return pushPackToCloud();
+}
+
+/**
+ * Phase 2 pull: list packs, download latest (or chosen) as browser file.
+ * User imports via ST Data Management → Import Backup.
+ */
+async function pullPackFromCloud({ packId = null } = {}) {
+    if (!assertExternalBridge('Pull pack')) return;
+    setStatus('Pull pack…', 'busy');
+    try {
+        const list = await apiFetch('/api/v2/wucloud/packs');
+        const items = list?.items || [];
+        if (!items.length) {
+            setStatus('Нет packs в облаке', 'err');
+            toast('warning', 'Облако пусто — сначала Push pack');
+            logLine('pack pull: empty list');
+            return;
+        }
+        logLine(`pack pull: ${items.length} packs · legacy_count=${list?.legacy_count ?? 0}`);
+        let target = items[0];
+        if (packId) {
+            target = items.find(i => Number(i.id) === Number(packId)) || target;
+        }
+        setStatus(`Pull: #${target.id}…`, 'busy');
+        const key = apiKey();
+        const url = `${baseUrl()}/api/v2/wucloud/packs/get?id=${target.id}`;
+        const res = await fetch(url, {
+            headers: { Authorization: `Bearer ${key}` },
+            signal: pushAbort?.signal,
+        });
+        if (!res.ok) {
+            const t = await res.text().catch(() => '');
+            throw new Error(formatApiError(null, t, res.status));
+        }
+        const blob = await res.blob();
+        const enc = String(target.encoding || '');
+        let fname = String(target.name || `pack-${target.id}`).replace(/[^\w.\-]+/g, '_').slice(0, 80);
+        if (enc === 'zip' && !fname.endsWith('.zip')) fname += '.zip';
+        else if (enc === 'gzip' && !fname.endsWith('.gz')) fname += '.gz';
+        const a = document.createElement('a');
+        const obj = URL.createObjectURL(blob);
+        a.href = obj;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(obj);
+        setStatus(`Pull: ${fname} (${Math.round(blob.size / 1024)} KB)`, 'ok');
+        toast('success', 'Pack скачан — Import Backup в ST');
+        logLine(`pack pull OK #${target.id} ${fname}`);
+    } catch (e) {
+        setStatus(`Pull: ${e.message}`, 'err');
+        toast('error', e.message);
+        logLine(`pack pull error: ${e.message}`);
+    }
+}
+
+async function listPacksCloud() {
+    if (!assertExternalBridge('List packs')) return;
+    try {
+        setStatus('List packs…', 'busy');
+        const list = await apiFetch('/api/v2/wucloud/packs');
+        const items = list?.items || [];
+        if (!items.length) {
+            logLine('packs: (empty)');
+            setStatus('Packs: 0', 'ok');
+            toast('info', 'Нет packs');
+            return;
+        }
+        for (const p of items.slice(0, 20)) {
+            const kb = Math.round((p.size_bytes || 0) / 1024);
+            logLine(`pack #${p.id} · ${p.name || p.client_key} · ${kb} KB · ${p.encoding || '?'} · ${p.source || ''}`);
+        }
+        if (items.length > 20) logLine(`… +${items.length - 20} more`);
+        setStatus(`Packs: ${items.length}`, 'ok');
+        toast('success', `${items.length} packs (см. журнал)`);
+    } catch (e) {
+        setStatus(`List: ${e.message}`, 'err');
+        toast('error', e.message);
     }
 }
 
@@ -1631,6 +1735,13 @@ async function importPresetToST(preset) {
 }
 
 async function syncPull({ importCharacters = true } = {}) {
+    // Phase 2: packs-first. Component dual-model pull is legacy/dead (410 platform).
+    return pullPackFromCloud();
+}
+
+/** @deprecated Phase 1 component pull — kept for reference, not wired. */
+async function syncPullLegacyComponents({ importCharacters = true } = {}) {
+    if (!assertExternalBridge('Pull')) return;
     setStatus('Pull: загрузка…', 'busy');
     await loadMap();
     const s = getSettings();
@@ -1830,6 +1941,14 @@ async function syncPull({ importCharacters = true } = {}) {
  * @param {boolean} [opts.chatsOnly] only push chats (bulk buttons); skip cards/personas/…
  */
 async function syncPush({ onlyCurrentChat = false, chatMode = null, chatsOnly = false } = {}) {
+    // Phase 2: packs-first. Component dual-model push is not the product path.
+    void onlyCurrentChat; void chatMode; void chatsOnly;
+    return pushPackToCloud();
+}
+
+/** @deprecated Phase 1 component push — not wired in UI. */
+async function syncPushLegacyComponents({ onlyCurrentChat = false, chatMode = null, chatsOnly = false } = {}) {
+    if (!assertExternalBridge('Push')) return;
     if (pushInFlight) {
         setStatus('Уже идёт синхронизация…', 'busy');
         return;
@@ -1989,13 +2108,9 @@ function setStopButtonVisible(visible) {
 // ─── Autosave ─────────────────────────────────────────────────────────────
 
 function scheduleAutosave() {
-    const s = getSettings();
-    if (s.autosave !== 'message' || !s.sync_chats) return;
-    const sec = Math.max(2, Number(s.debounce_sec) || 8);
-    if (autosaveTimer) clearTimeout(autosaveTimer);
-    autosaveTimer = setTimeout(() => {
-        syncPush({ onlyCurrentChat: true }).catch(e => logLine(`autosave: ${e.message}`));
-    }, sec * 1000);
+    // Phase 2 packs: no autosave of full ST zip on every message (too heavy).
+    // Nest: never cloud-write. Legacy component autosave retired.
+    return;
 }
 
 function setupIntervalAutosave() {
@@ -2003,12 +2118,63 @@ function setupIntervalAutosave() {
         clearInterval(intervalHandle);
         intervalHandle = null;
     }
-    const s = getSettings();
-    if (s.autosave !== 'interval' || !s.sync_chats) return;
-    const sec = Math.max(15, Number(s.debounce_sec) || 60);
-    intervalHandle = setInterval(() => {
-        syncPush({ onlyCurrentChat: true }).catch(e => logLine(`interval: ${e.message}`));
-    }, sec * 1000);
+    // Phase 2: packs are manual Push only (no interval full-zip).
+}
+
+/**
+ * ST importTheme() saves the file + power_user.theme name but does NOT call
+ * applyTheme() — UI stays on previous colors until user re-selects.
+ * Re-fire #themes change so stock ST applyTheme runs (user freedom: we only
+ * apply what they already selected, never pick a theme for them).
+ */
+function reapplySelectedTheme(reason = '') {
+    try {
+        const $ = (typeof jQuery !== 'undefined') ? jQuery : null;
+        if (!$) return;
+        const c = ctx();
+        const pu = c.powerUserSettings || c.power_user || {};
+        const name = String(pu.theme || '').trim() || String($('#themes').val() || '').trim();
+        if (!name) return;
+        const $sel = $('#themes');
+        if (!$sel.length) return;
+        let val = null;
+        $sel.find('option').each(function () {
+            const v = String(this.value || '');
+            const t = String($(this).text() || '').trim();
+            if (v === name || t === name || v.includes(name) || name.includes(v)) {
+                val = this.value;
+                return false;
+            }
+        });
+        if (val == null) return; // theme file not in list yet
+        // Force change event even if value already selected (ST skips applyTheme otherwise)
+        if ($sel.val() === val) {
+            $sel.val('');
+        }
+        $sel.val(val);
+        $sel.trigger('change');
+        if (reason) logLine(`theme reapply (${reason}): ${val}`);
+    } catch (e) {
+        logLine(`theme reapply: ${e.message || e}`);
+    }
+}
+
+/** Nest defaults: Russian UI if browser is ru* and user never chose a language. */
+function ensureNestLocaleDefault() {
+    if (!isNestMode()) return;
+    try {
+        if (localStorage.getItem('language')) return;
+        const nav = String(navigator.language || navigator.userLanguage || '').toLowerCase();
+        if (nav === 'ru' || nav.startsWith('ru-')) {
+            localStorage.setItem('language', 'ru-ru');
+            logLine('locale default → ru-ru (Nest)');
+            // One reload so i18n picks it up (same as ST language select)
+            if (!sessionStorage.getItem('wucloud_locale_reload')) {
+                sessionStorage.setItem('wucloud_locale_reload', '1');
+                location.reload();
+            }
+        }
+    } catch (_) { /* ignore */ }
 }
 
 function bindEvents() {
@@ -2026,6 +2192,21 @@ function bindEvents() {
     ].filter(Boolean);
     for (const t of types) {
         try { es.on(t, bump); } catch (_) { /* ignore */ }
+    }
+    // Apply selected theme after settings hydrate (importTheme does not apply).
+    const loaded = et.SETTINGS_LOADED || et.SETTINGS_LOADED_AFTER || et.APP_READY;
+    if (loaded) {
+        try {
+            es.on(loaded, () => setTimeout(() => reapplySelectedTheme('settings-loaded'), 100));
+        } catch (_) { /* ignore */ }
+    }
+    // After UI theme file import, ST only appends option — force apply.
+    const file = document.getElementById('ui_preset_import_file');
+    if (file && !file.dataset.wuThemeHook) {
+        file.dataset.wuThemeHook = '1';
+        file.addEventListener('change', () => {
+            setTimeout(() => reapplySelectedTheme('theme-import'), 400);
+        });
     }
 }
 
@@ -2088,32 +2269,23 @@ function bindUi() {
     }
     updateChatModeHint();
 
-    $('wucloud_push_btn')?.addEventListener('click', () => syncPush({}));
-    // Chat bulk overrides (chats only — ignore cards/personas/presets this run)
-    $('wucloud_push_all_chats_btn')?.addEventListener('click', () => syncPush({
-        chatMode: 'character',
-        chatsOnly: true,
-    }));
-    $('wucloud_push_all_lib_btn')?.addEventListener('click', () => {
+    $('wucloud_push_btn')?.addEventListener('click', () => {
         const ok = confirm(
-            'Выгрузить ВСЕ чаты ВСЕХ персонажей в облако?\n\n'
-            + 'Это может занять много времени. Можно нажать «Стоп».',
+            'Push pack: zip ST data (или JSON fallback) → WuCloud object store?\n\n'
+            + 'Список: Dashboard → WuCloud packs.',
         );
         if (!ok) return;
-        syncPush({ chatMode: 'all', chatsOnly: true });
+        pushPackToCloud().catch(() => {});
     });
-    $('wucloud_push_chat_btn')?.addEventListener('click', () => syncPush({ onlyCurrentChat: true }));
-    $('wucloud_backup_btn')?.addEventListener('click', () => {
+    $('wucloud_pull_btn')?.addEventListener('click', () => {
         const ok = confirm(
-            'Собрать снимок аккаунта ST (pack JSON) в облако?\n\n'
-            + 'Это не zip всей папки data/ — для полного zip загрузите файл на сайте:\n'
-            + 'Dashboard → Бэкапы ST.\n\n'
-            + 'Большие библиотеки могут занять время (Стоп — отмена).',
+            'Pull pack: скачать последний pack из облака?\n\n'
+            + 'Затем: SillyTavern → Data Management → Import Backup.',
         );
         if (!ok) return;
-        pushUserBackupSnapshot().catch(() => {});
+        pullPackFromCloud().catch(() => {});
     });
-    $('wucloud_pull_btn')?.addEventListener('click', () => syncPull({ importCharacters: true }));
+    $('wucloud_list_btn')?.addEventListener('click', () => listPacksCloud().catch(() => {}));
     $('wucloud_stop_btn')?.addEventListener('click', () => cancelPush());
     $('wucloud_test_btn')?.addEventListener('click', () => testConnection());
     $('wucloud_log_copy')?.addEventListener('click', () => copyLog());
@@ -2136,9 +2308,290 @@ function updateChatModeHint() {
     }
 }
 
+function isManagedNestHost() {
+    try {
+        if (typeof location === 'undefined') return false;
+        const host = String(location.hostname || '').toLowerCase();
+        return host === 'nest.wuproj.com' || host.endsWith('.nest.wuproj.com');
+    } catch (_) {
+        return false;
+    }
+}
+
+/** Phase 0 mode: nest companion vs external bridge */
+function getMode() {
+    if (isManagedNestHost() || !!getSettings().managed_nest) return 'nest';
+    return 'external';
+}
+
+function isNestMode() {
+    return getMode() === 'nest';
+}
+
+/**
+ * Nest companion must never write to WuApi BYTEA (st_cloud_artifacts).
+ * Live RP data is already on ST disk under data/wu-*.
+ */
+function assertExternalBridge(action) {
+    if (!isNestMode()) return true;
+    const msg = `Nest companion: «${action}» отключён — данные уже в таверне, без дубля в PG`;
+    logLine(msg);
+    setStatus('Nest: без cloud sync (Phase 0)', 'ok');
+    try {
+        toast('info', 'На Nest live-данные в ST. Cloud Push/Pull не нужен.');
+    } catch (_) { /* ignore */ }
+    return false;
+}
+
+/**
+ * Nest companion bootstrap: flag mode, force autosave off, optional session key
+ * (key kept for future export API / dashboard; NOT for st-sync push on Nest).
+ */
+async function maybeBootstrapManagedNest() {
+    if (!isManagedNestHost()) return false;
+    try {
+        const s = getSettings();
+        s.managed_nest = true;
+        // Phase 0: never auto-push chats into BYTEA from Nest
+        s.autosave = 'off';
+        s.dual_write_platform = false;
+        // st-sync host stays api (external packs later); LLM is Eco via ST profile
+        s.base_url = 'https://api.wuproj.com';
+
+        const res = await fetch('/_wu/api/me', { credentials: 'include', cache: 'no-store' });
+        if (!res.ok) {
+            logLine(`Nest companion: /_wu/api/me → ${res.status}`);
+            persist();
+            return true;
+        }
+        const me = await res.json();
+        const key = String(me?.apiKey || me?.api_key || '').trim();
+        if (key.startsWith('wu-')) {
+            s.api_key = key;
+            logLine(`Nest companion: session key ${key.slice(0, 6)}…${key.slice(-4)} (LLM/profile only)`);
+        } else {
+            logLine('Nest companion: session has no wu- key');
+        }
+        persist();
+        return true;
+    } catch (e) {
+        logLine(`Nest companion bootstrap: ${e.message || e}`);
+        return isManagedNestHost();
+    }
+}
+
+function fmtGiB(n) {
+    const g = Number(n || 0) / (1024 ** 3);
+    if (!isFinite(g) || g === 0) return '0';
+    if (g < 0.01) return g.toFixed(3);
+    if (g < 10) return g.toFixed(2);
+    return g.toFixed(1);
+}
+
+/** Nest: refresh FS quota from nestmgr (du data/wu-*) */
+async function refreshNestUsage() {
+    if (!isNestMode()) return;
+    const el = document.getElementById('wucloud_nest_quota');
+    const bar = document.getElementById('wucloud_nest_quota_bar');
+    try {
+        const res = await fetch('/_nest/usage', { credentials: 'include', cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const u = await res.json();
+        if (!u.access) {
+            if (el) el.textContent = 'нет доступа Nest';
+            return;
+        }
+        const used = Number(u.storage_used_bytes || 0);
+        const quota = Number(u.storage_quota_bytes || 0);
+        const pct = quota > 0 ? Math.min(100, Math.round((used / quota) * 100)) : 0;
+        if (el) {
+            el.textContent = `${fmtGiB(used)} / ${fmtGiB(quota)} ГБ · ${u.level || '—'} · ${pct}% · ${u.handle || ''}`;
+        }
+        if (bar) {
+            bar.style.width = `${pct}%`;
+            bar.classList.toggle('is-ok', pct < 85);
+        }
+    } catch (e) {
+        if (el) el.textContent = `квота: ${e.message || e}`;
+    }
+}
+
+/** Export: reuse ST native POST /api/users/backup (zip of data/wu-*) */
+async function nestExportZip() {
+    if (!isNestMode()) return;
+    try {
+        setStatus('Export zip…', 'busy');
+        const meRes = await fetch('/api/users/me', { headers: getRequestHeaders() });
+        if (!meRes.ok) throw new Error('не удалось получить handle');
+        const me = await meRes.json();
+        const handle = me.handle;
+        if (!handle) throw new Error('empty handle');
+        const res = await fetch('/api/users/backup', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ handle }),
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error || `backup HTTP ${res.status}`);
+        }
+        const blob = await res.blob();
+        const cd = res.headers.get('Content-Disposition') || '';
+        const m = /filename="?([^";]+)"?/i.exec(cd);
+        const filename = (m && m[1]) || `${handle}-backup.zip`;
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(url);
+        setStatus(`Export: ${filename}`, 'ok');
+        toast('success', 'Backup zip скачан');
+        logLine(`export zip ok ${filename}`);
+    } catch (e) {
+        setStatus(`Export: ${e.message}`, 'err');
+        toast('error', e.message);
+        logLine(`export: ${e.message}`);
+    }
+}
+
+/** Import: raw zip → nestmgr extracts into data/wu-* (refresh ST after).
+ *  Pass File/Blob as body (NOT arrayBuffer) — mobile OOMs/hangs on big backups
+ *  if we load the whole zip into RAM first → looks like “file picker then nothing”.
+ */
+async function nestImportZip(file) {
+    if (!file) {
+        toast('warning', 'Файл не выбран');
+        return;
+    }
+    if (!isNestMode()) {
+        toast('warning', 'Import zip только на Nest (nest.wuproj.com)');
+        logLine('import: not nest mode');
+        return;
+    }
+    const name = String(file.name || 'backup.zip');
+    const mb = (Number(file.size) || 0) / (1024 * 1024);
+    if (mb > 512) {
+        toast('error', `Zip слишком большой (${mb.toFixed(0)} МБ, max 512)`);
+        return;
+    }
+    try {
+        setStatus(`Import: ${name} (${mb.toFixed(1)} МБ)…`, 'busy');
+        toast('info', `Загрузка ${name}…`);
+        logLine(`import start name=${name} size_mb=${mb.toFixed(2)} type=${file.type || '?'}`);
+        // File is a Blob — browser streams + sets Content-Length. No full RAM buffer.
+        const res = await fetch('/_nest/import', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/zip' },
+            body: file,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            const hint = data.error || `HTTP ${res.status}`;
+            if (res.status === 401) throw new Error(`${hint} — войдите снова (cookie)`);
+            if (res.status === 413) throw new Error('Файл слишком большой для прокси');
+            throw new Error(hint);
+        }
+        setStatus(`Import: ${data.files || 0} files → ${data.handle}`, 'ok');
+        toast('success', 'Импорт готов — страница перезагрузится');
+        logLine(`import ok files=${data.files} handle=${data.handle}`);
+        refreshNestUsage();
+        setTimeout(() => {
+            try { location.reload(); } catch (_) { /* ignore */ }
+        }, 1200);
+    } catch (e) {
+        const msg = e?.message || String(e);
+        setStatus(`Import: ${msg}`, 'err');
+        toast('error', msg);
+        logLine(`import: ${msg}`);
+    }
+}
+
+/** Nest companion panel vs external bridge panel */
+function applyManagedUi() {
+    const nest = isNestMode();
+    const banner = document.getElementById('wucloud_managed_banner');
+    const external = document.getElementById('wucloud_external_panel');
+    const status = document.getElementById('wucloud_managed_key_status');
+    const modeBadge = document.getElementById('wucloud_mode_badge');
+
+    if (banner) banner.style.display = nest ? '' : 'none';
+    if (external) external.style.display = nest ? 'none' : '';
+    if (modeBadge) {
+        modeBadge.textContent = nest ? 'Nest' : 'External';
+        modeBadge.classList.toggle('is-nest', nest);
+        modeBadge.classList.toggle('is-ext', !nest);
+    }
+    if (status && nest) {
+        status.textContent = 'Live: ST data/wu-* · BYTEA sync OFF · LLM: WuProj / eco';
+        status.classList.add('is-ok');
+        status.classList.remove('is-bad');
+    }
+    const s = getSettings();
+    const keyEl = document.getElementById('wucloud_api_key');
+    const baseEl = document.getElementById('wucloud_base_url');
+    if (keyEl && s.api_key) keyEl.value = s.api_key;
+    if (baseEl) baseEl.value = s.base_url || 'https://api.wuproj.com';
+    if (nest) {
+        refreshNestUsage();
+        wireNestImportExport();
+    }
+}
+
+/** Bind Nest export/import — idempotent.
+ *  Import uses <label for=file> + full-size transparent overlay input (see settings.html).
+ *  Do NOT call input.click() from a button — Android/Chrome often ignore synthetic
+ *  open or grey-out files when accept= is set. No accept filter; validate in JS.
+ */
+function wireNestImportExport() {
+    const exp = document.getElementById('wucloud_nest_export');
+    const file = document.getElementById('wucloud_nest_import_file');
+    if (exp && !exp.dataset.bound) {
+        exp.dataset.bound = '1';
+        exp.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            nestExportZip();
+        });
+    }
+    if (file && !file.dataset.bound) {
+        file.dataset.bound = '1';
+        // Explicitly clear accept — leftover attribute greys zips on Android
+        try {
+            file.removeAttribute('accept');
+            file.accept = '';
+        } catch (_) { /* ignore */ }
+        let pickLock = false;
+        const onPick = () => {
+            if (pickLock) return;
+            const f = file.files && file.files[0];
+            if (!f) return;
+            pickLock = true;
+            try { file.value = ''; } catch (_) { /* ignore */ }
+            const n = String(f.name || '').toLowerCase();
+            const t = String(f.type || '').toLowerCase();
+            const looksZip = n.endsWith('.zip')
+                || t.includes('zip')
+                || t === 'application/octet-stream'
+                || t === '';
+            if (!looksZip) {
+                toast('warning', `Нужен .zip бэкап ST (выбрано: ${f.name || t || 'file'})`);
+                logLine(`import: reject non-zip name=${f.name} type=${t}`);
+                pickLock = false;
+                return;
+            }
+            Promise.resolve(nestImportZip(f)).finally(() => { pickLock = false; });
+        };
+        file.addEventListener('change', onPick);
+        // Some Android WebViews fire input instead of / with change
+        file.addEventListener('input', onPick);
+    }
+}
+
 async function init() {
     getSettings();
     await loadMap();
+    const managed = await maybeBootstrapManagedNest();
     try {
         let html = null;
         if (typeof renderExtensionTemplateAsync === 'function') {
@@ -2160,12 +2613,30 @@ async function init() {
     }
 
     bindUi();
+    applyManagedUi();
+    // Keep HTML badges in sync with EXT_VERSION (never hardcode drift)
+    try {
+        const b = document.getElementById('wucloud_ver_badge');
+        if (b) b.textContent = EXT_VERSION;
+        const f = document.getElementById('wucloud_ver_foot');
+        if (f) f.textContent = `v${EXT_VERSION} · Phase 2 packs`;
+    } catch (_) { /* ignore */ }
+    ensureNestLocaleDefault();
     bindEvents();
     setupIntervalAutosave();
-    logLine(`WuCloud Sync ${EXT_VERSION} loaded · chat_mode=${chatPushMode()} · dual=${!!getSettings().dual_write_platform} · backup=on`);
-    setStatus(`Готов · WuCloud Sync ${EXT_VERSION}`, 'ok');
-    toast('info', `WuCloud ${EXT_VERSION}`);
-    console.log(LOG_PREFIX, `loaded v${EXT_VERSION}`);
+    // Late reapply if settings already loaded before our handlers bound
+    setTimeout(() => reapplySelectedTheme('init'), 800);
+    const mode = getMode();
+    const keyOk = apiKey().startsWith('wu-');
+    logLine(`WuCloud ${EXT_VERSION} mode=${mode} · nestHost=${managed} · key=${keyOk ? 'yes' : 'n/a'} · BYTEA_sync=${mode === 'external' ? 'on' : 'OFF'}`);
+    if (mode === 'nest') {
+        setStatus(`Nest companion ${EXT_VERSION} · без cloud sync`, 'ok');
+        toast('info', `WuCloud Nest · live data на диске ST`);
+    } else {
+        setStatus(keyOk ? `External bridge ${EXT_VERSION}` : `External · нет ключа`, keyOk ? 'ok' : 'err');
+        toast('info', `WuCloud External ${EXT_VERSION}`);
+    }
+    console.log(LOG_PREFIX, `loaded v${EXT_VERSION} mode=${mode}`);
 }
 
 if (document.readyState === 'loading') {
