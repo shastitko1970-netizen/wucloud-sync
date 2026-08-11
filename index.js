@@ -16,7 +16,7 @@ const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.14.5';
+const EXT_VERSION = '0.14.6';
 
 /** @typedef {'external' | 'nest'} WuCloudMode */
 
@@ -688,6 +688,134 @@ async function pushChatPayload({ clientKey, title, jsonl }) {
 }
 
 /**
+ * Discover third-party extensions + git remote URLs.
+ * ST user backup only includes data/<handle>/extensions — global installs
+ * (public/.../third-party) ship empty extensions/ in the zip while
+ * extension_settings still carry configs. We embed a reinstall manifest so Nest
+ * can git-clone missing folders after import.
+ * @returns {Promise<Array<{folder:string,type:string,remote_url:string,display_name?:string,version?:string,settings_key?:string}>>}
+ */
+async function collectThirdPartyExtensions() {
+    const headers = getRequestHeaders();
+    /** @type {Array<{folder:string,type:string,remote_url:string,display_name?:string,version?:string,settings_key?:string}>} */
+    const out = [];
+    let list = [];
+    try {
+        const res = await fetch('/api/extensions/discover', {
+            headers,
+            signal: pushAbort?.signal,
+        });
+        if (res.ok) list = await res.json();
+        else logLine(`ext discover HTTP ${res.status}`);
+    } catch (e) {
+        logLine(`ext discover fail: ${e?.message || e}`);
+        return out;
+    }
+    if (!Array.isArray(list)) return out;
+
+    for (const e of list) {
+        if (isPushAborted()) throw new Error('Отменено');
+        if (!e || e.type === 'system') continue;
+        const rawName = String(e.name || '');
+        if (!rawName.includes('third-party/') && e.type !== 'local' && e.type !== 'global') continue;
+        const folder = rawName.replace(/^third-party\//, '').replace(/\\/g, '/').split('/').filter(Boolean).pop();
+        if (!folder || folder === 'wucloud-sync') continue; // Nest seeds companion separately
+
+        let remoteUrl = '';
+        let displayName = '';
+        let version = '';
+        try {
+            const vRes = await fetch('/api/extensions/version', {
+                method: 'POST',
+                headers: { ...headers, 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    extensionName: folder,
+                    global: e.type === 'global',
+                }),
+                signal: pushAbort?.signal,
+            });
+            if (vRes.ok) {
+                const v = await vRes.json();
+                remoteUrl = String(v?.remoteUrl || '').trim();
+            }
+        } catch (_) { /* no git remote */ }
+
+        try {
+            const mRes = await fetch(`/scripts/extensions/third-party/${encodeURIComponent(folder)}/manifest.json`, {
+                headers,
+                signal: pushAbort?.signal,
+            });
+            if (mRes.ok) {
+                const m = await mRes.json();
+                displayName = String(m?.display_name || m?.displayName || '').trim();
+                version = String(m?.version || '').trim();
+                if (!remoteUrl && m?.homePage && /github\.com|gitlab\.com|codeberg\.org/i.test(String(m.homePage))) {
+                    remoteUrl = String(m.homePage).trim();
+                }
+            }
+        } catch (_) { /* ignore */ }
+
+        // settings keys often differ from folder (e.g. horae vs SillyTavern-Horae)
+        let settingsKey = '';
+        try {
+            const es = extension_settings || {};
+            if (es[folder] != null) settingsKey = folder;
+            else {
+                const low = folder.toLowerCase();
+                for (const k of Object.keys(es)) {
+                    if (k.toLowerCase() === low || low.includes(k.toLowerCase()) || k.toLowerCase().includes(low)) {
+                        settingsKey = k;
+                        break;
+                    }
+                }
+            }
+        } catch (_) { /* ignore */ }
+
+        out.push({
+            folder,
+            type: String(e.type || 'local'),
+            remote_url: remoteUrl,
+            display_name: displayName || undefined,
+            version: version || undefined,
+            settings_key: settingsKey || undefined,
+        });
+        await yieldToUI(0);
+    }
+    logLine(`ext manifest: ${out.length} third-party (${out.filter((x) => x.remote_url).length} with git url)`);
+    return out;
+}
+
+/** Persist manifest into user/files so ST zip backup includes it. */
+async function writeExtensionsManifestToUserFiles(entries) {
+    const payload = {
+        version: 1,
+        format: 'wucloud_extensions',
+        created_at: new Date().toISOString(),
+        ext_version: EXT_VERSION,
+        extensions: entries || [],
+    };
+    const json = JSON.stringify(payload, null, 2);
+    const b64 = btoa(unescape(encodeURIComponent(json)));
+    try {
+        const res = await fetch('/api/files/upload', {
+            method: 'POST',
+            headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: 'wucloud-extensions.json', data: b64 }),
+            signal: pushAbort?.signal,
+        });
+        if (!res.ok) {
+            logLine(`ext manifest write HTTP ${res.status}`);
+            return false;
+        }
+        logLine('ext manifest written → user/files/wucloud-extensions.json');
+        return true;
+    } catch (e) {
+        logLine(`ext manifest write fail: ${e?.message || e}`);
+        return false;
+    }
+}
+
+/**
  * Phase 2: push one ST data pack to object store (/api/v2/wucloud/packs).
  * Prefer ST native zip via /api/users/backup; fallback JSON asset pack.
  */
@@ -707,6 +835,20 @@ async function pushPackToCloud() {
         let blob = null;
         let filename = '';
         let format = 'zip';
+        /** @type {Array<{folder:string,type:string,remote_url:string}>} */
+        let extManifest = [];
+
+        // 0) Extension reinstall manifest (settings alone don't install code)
+        try {
+            setStatus('Push: scan extensions…', 'busy');
+            extManifest = await collectThirdPartyExtensions();
+            if (extManifest.length) {
+                await writeExtensionsManifestToUserFiles(extManifest);
+            }
+        } catch (e) {
+            if (e?.message === 'Отменено') throw e;
+            logLine(`ext scan: ${e?.message || e}`);
+        }
 
         // 1) ST native backup zip (multi-user or default handle)
         try {
@@ -744,7 +886,7 @@ async function pushPackToCloud() {
         // 2) JSON asset pack fallback (no multi-user backup)
         if (!blob) {
             setStatus('Push: JSON pack…', 'busy');
-            const json = await buildJsonAssetPack();
+            const json = await buildJsonAssetPack(extManifest);
             const { bytes, gzipped } = await maybeGzip(json);
             blob = new Blob([bytes], { type: gzipped ? 'application/gzip' : 'application/json' });
             const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
@@ -753,7 +895,7 @@ async function pushPackToCloud() {
             logLine(`pack push: JSON ${Math.round(blob.size / 1024)} KB`);
             toast(
                 'warning',
-                'ST zip backup недоступен — ушёл JSON-pack (chars/chats). '
+                'ST zip backup недоступен — ушёл JSON-pack (chars/chats + ext manifest). '
                 + 'Для полного Nest-переноса: Data → Backup zip, затем Push.',
             );
         }
@@ -790,6 +932,7 @@ async function pushPackToCloud() {
             source: 'wucloud-sync',
             format,
             ext_version: EXT_VERSION,
+            extensions: extManifest,
         });
 
         // Multi‑GB: one POST of 1.3GiB → Failed to fetch on most browsers.
@@ -900,7 +1043,7 @@ async function pushPackToCloud() {
 }
 
 /** Build lightweight JSON asset pack when ST zip backup is unavailable. */
-async function buildJsonAssetPack() {
+async function buildJsonAssetPack(extManifest = null) {
     const c = ctx();
     const characters = c.characters || [];
     const pack = {
@@ -910,7 +1053,14 @@ async function buildJsonAssetPack() {
         source: 'wucloud-sync',
         ext_version: EXT_VERSION,
         note: 'JSON asset pack fallback. Prefer ST /api/users/backup zip when available.',
-        assets: { characters: [], chats: [], personas: {}, lorebooks: {}, presets: [] },
+        assets: {
+            characters: [],
+            chats: [],
+            personas: {},
+            lorebooks: {},
+            presets: [],
+            extensions: Array.isArray(extManifest) ? extManifest : [],
+        },
     };
     for (let i = 0; i < characters.length; i++) {
         if (isPushAborted()) throw new Error('Отменено');
@@ -956,6 +1106,11 @@ async function buildJsonAssetPack() {
         const worlds = c.world_names || c.worldNames || [];
         if (Array.isArray(worlds)) pack.assets.lorebooks = { names: worlds };
     } catch (_) { /* ignore */ }
+    if (!pack.assets.extensions?.length) {
+        try {
+            pack.assets.extensions = await collectThirdPartyExtensions();
+        } catch (_) { /* ignore */ }
+    }
     return JSON.stringify(pack);
 }
 
