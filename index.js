@@ -16,7 +16,7 @@ const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.14.4';
+const EXT_VERSION = '0.14.5';
 
 /** @typedef {'external' | 'nest'} WuCloudMode */
 
@@ -773,43 +773,98 @@ async function pushPackToCloud() {
             );
         }
         if (blob.size > 100 * 1024 * 1024) {
-            toast('info', `Большой pack ${sizeLabel} — загрузка может занять несколько минут…`);
-            // Prefer long timeout for multi‑GB (settings default 90s is too low)
+            toast('info', `Большой pack ${sizeLabel} — грузим чанками (~80 МиБ)…`);
             try {
                 const s = getSettings();
-                if ((Number(s.request_timeout_sec) || 90) < 1800) {
-                    s.request_timeout_sec = 3600;
+                if ((Number(s.request_timeout_sec) || 90) < 600) {
+                    s.request_timeout_sec = 900;
                     persist();
-                    logLine('pack push: raised request_timeout_sec to 3600 for large pack');
+                    logLine('pack push: raised request_timeout_sec to 900 for chunked pack');
                 }
             } catch (_) { /* */ }
         }
 
-        const ab = await blob.arrayBuffer();
-        const hash = await sha256Hex(ab);
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
         const clientKey = `pack:mod:${stamp}`;
-
-        setStatus(`Push: upload ${sizeLabel}…`, 'busy');
-        // Rebuild FormData on each retry — body can be consumed after a failed attempt
-        const res = await apiFetch('/api/v2/wucloud/packs', {
-            method: 'POST',
-            retries: 3,
-            formDataFactory: () => {
-                const f = new FormData();
-                f.append('file', blob, filename || `pack-${stamp}.bin`);
-                f.append('client_key', clientKey);
-                f.append('name', filename || `ST pack ${stamp}`);
-                f.append('content_hash', hash);
-                f.append('source', 'mod');
-                f.append('meta', JSON.stringify({
-                    source: 'wucloud-sync',
-                    format,
-                    ext_version: EXT_VERSION,
-                }));
-                return f;
-            },
+        const metaStr = JSON.stringify({
+            source: 'wucloud-sync',
+            format,
+            ext_version: EXT_VERSION,
         });
+
+        // Multi‑GB: one POST of 1.3GiB → Failed to fetch on most browsers.
+        // Chunk under ~80MiB (safe for CF/nginx/browser).
+        const PACK_CHUNK = 80 * 1024 * 1024;
+        const useChunks = blob.size > PACK_CHUNK;
+        let res;
+
+        if (useChunks) {
+            const nChunks = Math.max(1, Math.ceil(blob.size / PACK_CHUNK));
+            const uploadId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+                ? crypto.randomUUID()
+                : `u${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+            // Pre-slice so File handle stays valid (Android)
+            const parts = [];
+            for (let i = 0; i < nChunks; i++) {
+                parts.push(blob.slice(i * PACK_CHUNK, Math.min(blob.size, (i + 1) * PACK_CHUNK)));
+            }
+            logLine(`pack push: chunked upload_id=${uploadId} chunks=${nChunks} chunk_mb=80`);
+            toast('info', `Чанки: 0/${nChunks} · ${sizeLabel}`);
+            for (let i = 0; i < nChunks; i++) {
+                if (isPushAborted()) throw new Error('Отменено');
+                setStatus(`Push: чанк ${i + 1}/${nChunks} · ${sizeLabel}`, 'busy');
+                logLine(`pack push: chunk ${i + 1}/${nChunks} size=${parts[i].size}`);
+                const chunkRes = await apiFetch('/api/v2/wucloud/packs', {
+                    method: 'POST',
+                    retries: 4,
+                    formDataFactory: () => {
+                        const f = new FormData();
+                        f.append('file', parts[i], filename || `pack-${stamp}.bin`);
+                        f.append('client_key', clientKey);
+                        f.append('name', filename || `ST pack ${stamp}`);
+                        f.append('source', 'mod');
+                        f.append('meta', metaStr);
+                        f.append('upload_id', uploadId);
+                        f.append('chunk', String(i));
+                        f.append('chunks', String(nChunks));
+                        // server hashes assembled file; skip 1.3GiB client hash
+                        f.append('content_hash', '');
+                        return f;
+                    },
+                });
+                res = chunkRes;
+                if (chunkRes?.done || chunkRes?.id) {
+                    logLine(`pack push: assemble done at chunk ${i + 1}/${nChunks}`);
+                    break;
+                }
+                if (chunkRes?.have != null) {
+                    logLine(`pack push: server have ${chunkRes.have}/${nChunks}`);
+                }
+            }
+            if (!res?.id && !res?.done) {
+                throw new Error('chunked upload incomplete — попробуйте ещё раз (resume по upload_id пока только на сервере по чанкам)');
+            }
+        } else {
+            // Small packs: single POST + client content hash
+            const ab = await blob.arrayBuffer();
+            const hash = await sha256Hex(ab);
+            setStatus(`Push: upload ${sizeLabel}…`, 'busy');
+            res = await apiFetch('/api/v2/wucloud/packs', {
+                method: 'POST',
+                retries: 3,
+                formDataFactory: () => {
+                    const f = new FormData();
+                    f.append('file', blob, filename || `pack-${stamp}.bin`);
+                    f.append('client_key', clientKey);
+                    f.append('name', filename || `ST pack ${stamp}`);
+                    f.append('content_hash', hash);
+                    f.append('source', 'mod');
+                    f.append('meta', metaStr);
+                    return f;
+                },
+            });
+        }
+
         const id = res?.id;
         logLine(res?.skipped
             ? `pack skip unchanged #${id}`
