@@ -1,21 +1,22 @@
 /**
- * WuCloud — SillyTavern extension v0.10 (Phase 2 packs)
+ * WuCloud — SillyTavern extension v0.11 (ST 1.15+ / Nest 1.18)
  *
  * Two modes (see docs/WUCLOUD.md):
  *   external  — bridge: local/foreign ST ↔ WuApi packs (zip object store)
  *   nest      — companion on nest.wuproj.com: live data is ST disk only; NO cloud Push/Pull
  *
  * Phase 2: Push/Pull = full ST data pack, not dual-model component blobs.
+ * ST 1.18: prefer SillyTavern.getContext() (getWorldInfoNames, getRequestHeaders, events).
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
  */
 import { getContext, extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
-import { getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
+import { getRequestHeaders as stGetRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
 
 const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.10.9';
+const EXT_VERSION = '0.14.4';
 
 /** @typedef {'external' | 'nest'} WuCloudMode */
 
@@ -57,19 +58,50 @@ let pushAbort = null;
 
 function ctx() {
     try {
-        if (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) {
+        if (typeof SillyTavern !== 'undefined' && typeof SillyTavern.getContext === 'function') {
             return SillyTavern.getContext();
         }
     } catch (_) { /* ignore */ }
-    return getContext();
+    try {
+        return getContext();
+    } catch (_) {
+        return {};
+    }
 }
 
 function libs() {
     try {
-        return (typeof SillyTavern !== 'undefined' && SillyTavern.libs) ? SillyTavern.libs : {};
-    } catch (_) {
-        return {};
-    }
+        if (typeof SillyTavern !== 'undefined' && SillyTavern.libs) return SillyTavern.libs;
+    } catch (_) { /* ignore */ }
+    try {
+        const c = ctx();
+        if (c?.libs) return c.libs;
+    } catch (_) { /* ignore */ }
+    return {};
+}
+
+/**
+ * CSRF + JSON headers for ST local API.
+ * ST 1.15+ exposes getRequestHeaders on context; fall back to script.js export.
+ */
+function getRequestHeaders(opts = {}) {
+    try {
+        const c = ctx();
+        if (typeof c.getRequestHeaders === 'function') {
+            return c.getRequestHeaders(opts);
+        }
+    } catch (_) { /* fall through */ }
+    try {
+        if (typeof stGetRequestHeaders === 'function') {
+            return stGetRequestHeaders(opts);
+        }
+    } catch (_) { /* ignore */ }
+    const headers = {};
+    if (!opts?.omitContentType) headers['Content-Type'] = 'application/json';
+    try {
+        if (typeof token !== 'undefined' && token) headers['X-CSRF-Token'] = token;
+    } catch (_) { /* ignore */ }
+    return headers;
 }
 
 function getSettings() {
@@ -183,19 +215,7 @@ function isPushAborted() {
  * and bulk chat listing silently finds 0 files.
  */
 function stHeaders({ omitContentType = false } = {}) {
-    try {
-        const c = ctx();
-        if (typeof c.getRequestHeaders === 'function') {
-            return c.getRequestHeaders({ omitContentType });
-        }
-    } catch (_) { /* fall through */ }
-    const headers = {};
-    if (!omitContentType) headers['Content-Type'] = 'application/json';
-    try {
-        // ST global token used by getRequestHeaders
-        if (typeof token !== 'undefined' && token) headers['X-CSRF-Token'] = token;
-    } catch (_) { /* ignore */ }
-    return headers;
+    return getRequestHeaders({ omitContentType });
 }
 
 /**
@@ -335,13 +355,39 @@ function toast(kind, msg) {
 }
 
 function baseUrl() {
-    let u = (getSettings().base_url || 'https://api.wuproj.com').trim();
+    let u = String(getSettings().base_url || 'https://api.wuproj.com');
+    // Strip zero-width / BOM / newlines that break fetch (Failed to fetch)
+    u = u.replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, '').trim();
     u = u.replace(/\/+$/, '');
     // Common mistakes: pasted full chat path or missing scheme
     u = u.replace(/\/v1(\/chat\/completions)?$/i, '');
     u = u.replace(/\/api\/v2.*$/i, '');
     if (u && !/^https?:\/\//i.test(u)) u = `https://${u}`;
+    // Force https for our hosts (http often blocked / mixed)
+    try {
+        const host = new URL(u || 'https://api.wuproj.com').hostname.toLowerCase();
+        if (host === 'api.wuproj.com' || host === 'eco.wuproj.com' || host.endsWith('.wuproj.com')) {
+            u = u.replace(/^http:\/\//i, 'https://');
+        }
+    } catch (_) {
+        u = 'https://api.wuproj.com';
+    }
     return u || 'https://api.wuproj.com';
+}
+
+function isNetworkFetchError(e) {
+    const msg = String(e?.message || e || '').toLowerCase();
+    const name = String(e?.name || '');
+    if (name === 'TypeError' && msg.includes('fetch')) return true;
+    return (
+        msg.includes('failed to fetch')
+        || msg.includes('networkerror')
+        || msg.includes('network request failed')
+        || msg.includes('load failed')
+        || msg.includes('err_connection')
+        || msg.includes('err_name_not_resolved')
+        || msg.includes('err_timed_out')
+    );
 }
 
 /** Normalize key from dashboard: strip Bearer/, quotes, whitespace. Must start with wu- */
@@ -411,60 +457,119 @@ async function maybeGzip(text) {
     return { bytes: plain, gzipped: false };
 }
 
-async function apiFetch(path, { method = 'GET', body = null, formData = null } = {}) {
+/**
+ * @param {string} path
+ * @param {{ method?: string, body?: any, formData?: FormData|null, retries?: number, formDataFactory?: (() => FormData)|null }} opts
+ * formDataFactory: rebuild FormData per attempt (streams / some browsers consume body).
+ */
+async function apiFetch(path, {
+    method = 'GET',
+    body = null,
+    formData = null,
+    retries = 2,
+    formDataFactory = null,
+} = {}) {
     const key = apiKey();
     if (!key) throw new Error('Введите API-ключ wu-… из кабинета WuProj (Dashboard → API keys)');
     if (!key.startsWith('wu-')) {
         throw new Error('Ключ должен начинаться с wu- (это API-ключ, не пароль и не JWT). Возьмите в Dashboard → API keys.');
     }
 
-    const headers = { Authorization: `Bearer ${key}` };
-    let payload = body;
-    if (formData) {
-        payload = formData;
-    } else if (body && typeof body === 'object' && !(body instanceof Blob) && !(body instanceof Uint8Array)) {
-        headers['Content-Type'] = 'application/json';
-        payload = JSON.stringify(body);
-    }
-
     const url = `${baseUrl()}${path}`;
     const timeoutMs = requestTimeoutMs();
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    // Link outer cancel (Stop): AbortController has .signal, not addEventListener
-    const onOuterAbort = () => ctrl.abort();
-    const outerSignal = pushAbort && pushAbort.signal ? pushAbort.signal : null;
-    if (outerSignal) {
-        if (outerSignal.aborted) {
+    const maxAttempts = Math.max(1, 1 + (Number(retries) || 0));
+    let lastErr = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (isPushAborted()) throw new Error('Отменено');
+
+        const headers = { Authorization: `Bearer ${key}` };
+        let payload = body;
+        if (typeof formDataFactory === 'function') {
+            payload = formDataFactory();
+        } else if (formData) {
+            payload = formData;
+        } else if (body && typeof body === 'object' && !(body instanceof Blob) && !(body instanceof Uint8Array)) {
+            headers['Content-Type'] = 'application/json';
+            payload = JSON.stringify(body);
+        }
+
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+        const onOuterAbort = () => ctrl.abort();
+        const outerSignal = pushAbort && pushAbort.signal ? pushAbort.signal : null;
+        if (outerSignal) {
+            if (outerSignal.aborted) {
+                clearTimeout(timer);
+                throw new Error('Отменено');
+            }
+            outerSignal.addEventListener('abort', onOuterAbort, { once: true });
+        }
+
+        try {
+            const res = await fetch(url, {
+                method,
+                headers,
+                body: payload,
+                signal: ctrl.signal,
+                mode: 'cors',
+                credentials: 'omit',
+                cache: 'no-store',
+            });
+            const text = await res.text();
+            let json = null;
+            try { json = text ? JSON.parse(text) : null; } catch (_) { /* raw */ }
+            if (!res.ok) {
+                const errMsg = formatApiError(json, text, res.statusText);
+                // Retry transient edge/gateway errors
+                if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxAttempts) {
+                    lastErr = new Error(`${res.status}: ${errMsg}`);
+                    logLine(`apiFetch retry ${attempt}/${maxAttempts} ${path} HTTP ${res.status}`);
+                    await new Promise((r) => setTimeout(r, 600 * attempt));
+                    continue;
+                }
+                if (res.status === 401) {
+                    throw new Error(`401 Unauthorized: ${errMsg}. Проверьте ключ wu-… (скопируйте заново из кабинета, без пробелов).`);
+                }
+                throw new Error(`${res.status}: ${errMsg}`);
+            }
+            return json;
+        } catch (e) {
+            if (e?.message === 'Отменено' || e?.message?.startsWith('401') || e?.message?.match(/^[45]\d\d:/)) {
+                // non-retryable business/auth errors already formatted
+                if (e?.message?.match(/^[45]\d\d:/) && !e?.message?.match(/^50[234]:/)) throw e;
+                if (e?.message?.startsWith('401') || e?.message === 'Отменено') throw e;
+            }
+            if (e?.name === 'AbortError') {
+                if (isPushAborted()) throw new Error('Отменено');
+                lastErr = new Error(`Таймаут ${Math.round(timeoutMs / 1000)}с: ${path}`);
+            } else if (isNetworkFetchError(e) || String(e?.message || '').startsWith('Сеть:')) {
+                lastErr = e;
+            } else if (String(e?.message || '').match(/^50[234]:/)) {
+                lastErr = e;
+            } else {
+                throw e;
+            }
+            if (attempt < maxAttempts && (isNetworkFetchError(e) || e?.name === 'AbortError' || String(e?.message || '').match(/^50[234]:/))) {
+                logLine(`apiFetch retry ${attempt}/${maxAttempts} ${path}: ${e?.message || e}`);
+                await new Promise((r) => setTimeout(r, 700 * attempt));
+                continue;
+            }
+            // final network error — human message
+            const base = baseUrl();
+            const nestHint = isNestMode()
+                ? ' На Nest для переноса используйте «Из облака» / Import, не Push pack.'
+                : ' Откройте в браузере https://api.wuproj.com/health — должен быть {"status":"ok"}.';
+            throw new Error(
+                `Сеть: ${lastErr?.message || e?.message || 'Failed to fetch'} (url=${url}). `
+                + `Проверьте интернет, base URL (${base}), VPN/блокировки.${nestHint}`,
+            );
+        } finally {
             clearTimeout(timer);
-            throw new Error('Отменено');
+            if (outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
         }
-        outerSignal.addEventListener('abort', onOuterAbort, { once: true });
     }
-    let res;
-    try {
-        res = await fetch(url, { method, headers, body: payload, signal: ctrl.signal });
-    } catch (e) {
-        if (e?.name === 'AbortError') {
-            if (isPushAborted()) throw new Error('Отменено');
-            throw new Error(`Таймаут ${Math.round(timeoutMs / 1000)}с: ${path}`);
-        }
-        throw new Error(`Сеть: ${e.message} (url=${url}). Проверьте base URL и CORS.`);
-    } finally {
-        clearTimeout(timer);
-        if (outerSignal) outerSignal.removeEventListener('abort', onOuterAbort);
-    }
-    const text = await res.text();
-    let json = null;
-    try { json = text ? JSON.parse(text) : null; } catch (_) { /* raw */ }
-    if (!res.ok) {
-        const errMsg = formatApiError(json, text, res.statusText);
-        if (res.status === 401) {
-            throw new Error(`401 Unauthorized: ${errMsg}. Проверьте ключ wu-… (скопируйте заново из кабинета, без пробелов).`);
-        }
-        throw new Error(`${res.status}: ${errMsg}`);
-    }
-    return json;
+    throw lastErr || new Error('Сеть: запрос не удался');
 }
 
 /** Quick auth check against quotas endpoint */
@@ -646,28 +751,65 @@ async function pushPackToCloud() {
             filename = gzipped ? `st-pack-${stamp}.json.gz` : `st-pack-${stamp}.json`;
             format = gzipped ? 'json.gz' : 'json';
             logLine(`pack push: JSON ${Math.round(blob.size / 1024)} KB`);
+            toast(
+                'warning',
+                'ST zip backup недоступен — ушёл JSON-pack (chars/chats). '
+                + 'Для полного Nest-переноса: Data → Backup zip, затем Push.',
+            );
         }
 
         if (isPushAborted()) throw new Error('Отменено');
+
+        const sizeMB = (blob.size || 0) / (1024 * 1024);
+        const sizeLabel = sizeMB >= 1024
+            ? `${(sizeMB / 1024).toFixed(2)} ГиБ`
+            : `${sizeMB.toFixed(1)} МиБ`;
+        logLine(`pack push: upload size ${sizeLabel} (${blob.size} bytes)`);
+        // Soft guide: very large zips need current API (4 GiB) + long timeout
+        if (blob.size > 3.5 * 1024 * 1024 * 1024) {
+            throw new Error(
+                `Pack слишком большой (${sizeLabel}). Макс. ~4 ГиБ. `
+                + 'Сожмите backup или перенесите через Nest Export/Import без cloud pack.',
+            );
+        }
+        if (blob.size > 100 * 1024 * 1024) {
+            toast('info', `Большой pack ${sizeLabel} — загрузка может занять несколько минут…`);
+            // Prefer long timeout for multi‑GB (settings default 90s is too low)
+            try {
+                const s = getSettings();
+                if ((Number(s.request_timeout_sec) || 90) < 1800) {
+                    s.request_timeout_sec = 3600;
+                    persist();
+                    logLine('pack push: raised request_timeout_sec to 3600 for large pack');
+                }
+            } catch (_) { /* */ }
+        }
 
         const ab = await blob.arrayBuffer();
         const hash = await sha256Hex(ab);
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
         const clientKey = `pack:mod:${stamp}`;
-        const fd = new FormData();
-        fd.append('file', blob, filename || `pack-${stamp}.bin`);
-        fd.append('client_key', clientKey);
-        fd.append('name', filename || `ST pack ${stamp}`);
-        fd.append('content_hash', hash);
-        fd.append('source', 'mod');
-        fd.append('meta', JSON.stringify({
-            source: 'wucloud-sync',
-            format,
-            ext_version: EXT_VERSION,
-        }));
 
-        setStatus('Push: upload…', 'busy');
-        const res = await apiFetch('/api/v2/wucloud/packs', { method: 'POST', formData: fd });
+        setStatus(`Push: upload ${sizeLabel}…`, 'busy');
+        // Rebuild FormData on each retry — body can be consumed after a failed attempt
+        const res = await apiFetch('/api/v2/wucloud/packs', {
+            method: 'POST',
+            retries: 3,
+            formDataFactory: () => {
+                const f = new FormData();
+                f.append('file', blob, filename || `pack-${stamp}.bin`);
+                f.append('client_key', clientKey);
+                f.append('name', filename || `ST pack ${stamp}`);
+                f.append('content_hash', hash);
+                f.append('source', 'mod');
+                f.append('meta', JSON.stringify({
+                    source: 'wucloud-sync',
+                    format,
+                    ext_version: EXT_VERSION,
+                }));
+                return f;
+            },
+        });
         const id = res?.id;
         logLine(res?.skipped
             ? `pack skip unchanged #${id}`
@@ -680,9 +822,19 @@ async function pushPackToCloud() {
             setStatus('Push отменён', 'err');
             logLine('pack push: cancelled');
         } else {
+            // If network died after server wrote pack, list may still show it
             setStatus(`Push: ${e.message}`, 'err');
             toast('error', e.message);
             logLine(`pack push error: ${e.message}`);
+            try {
+                const list = await apiFetch('/api/v2/wucloud/packs', { retries: 1 });
+                const items = list?.items || [];
+                if (items.length) {
+                    const last = items[0];
+                    logLine(`pack push: after error, cloud has #${last.id} ${last.name || ''} — возможно upload прошёл`);
+                    toast('info', `В облаке уже есть pack #${last.id}. Проверьте Dashboard → WuCloud packs.`);
+                }
+            } catch (_) { /* ignore secondary */ }
         }
         throw e;
     } finally {
@@ -1293,16 +1445,26 @@ async function listSTWorldInfoNames() {
     const c = ctx();
     let names = [];
 
-    // 1) Context / globals
+    // 1) ST 1.18 getContext().getWorldInfoNames() — preferred public API
     try {
-        const fromCtx = c.worldInfoSettings?.world_names
-            || c.world_names
-            || c.worldInfoNames
-            || (typeof world_names !== 'undefined' ? world_names : null);
-        if (Array.isArray(fromCtx)) names = fromCtx.slice();
+        if (typeof c.getWorldInfoNames === 'function') {
+            const fromApi = c.getWorldInfoNames();
+            if (Array.isArray(fromApi) && fromApi.length) names = fromApi.slice();
+        }
     } catch (_) { /* ignore */ }
 
-    // 2) Module import (most reliable on modern ST)
+    // 2) Context / globals
+    if (!names.length) {
+        try {
+            const fromCtx = c.worldInfoSettings?.world_names
+                || c.world_names
+                || c.worldInfoNames
+                || (typeof world_names !== 'undefined' ? world_names : null);
+            if (Array.isArray(fromCtx)) names = fromCtx.slice();
+        } catch (_) { /* ignore */ }
+    }
+
+    // 3) Module import (fallback)
     if (!names.length) {
         try {
             const mod = await import(/* webpackIgnore: true */ '/scripts/world-info.js');
@@ -2464,11 +2626,77 @@ function looksLikeStBackup(name, type) {
         || t === 'application/octet-stream' || t === '';
 }
 
-/** CF free/pro kills single POST >~100MB → "Failed to fetch". Chunk under that. */
-const NEST_IMPORT_CHUNK = 48 * 1024 * 1024;
+/**
+ * CF free/pro kills single POST >~100MB → "Failed to fetch".
+ * 80MB: fewer round-trips than 48MB, still under CF limit with headroom.
+ * Parallel POSTs fill the pipe better on Wi‑Fi (server flock-serializes assemble).
+ */
+const NEST_IMPORT_CHUNK = 80 * 1024 * 1024;
+const NEST_IMPORT_LS = 'wucloud_nest_import_v1';
+const NEST_IMPORT_CHUNK_RETRIES = 10;
+/** Default parallel chunk uploads; throttled on slow cellular. */
+const NEST_IMPORT_CONCURRENCY_MAX = 3;
+
+function nestImportSleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Adaptive parallelism: slow cell → 1, 3g → 2, else up to 3. */
+function nestImportConcurrency() {
+    try {
+        const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+        if (c) {
+            if (c.saveData) return 1;
+            const t = String(c.effectiveType || '').toLowerCase();
+            if (t === 'slow-2g' || t === '2g') return 1;
+            if (t === '3g') return 2;
+            const down = Number(c.downlink);
+            if (Number.isFinite(down) && down > 0 && down < 1.5) return 1;
+        }
+    } catch (_) { /* */ }
+    return NEST_IMPORT_CONCURRENCY_MAX;
+}
+
+function nestImportLoadSession() {
+    try {
+        return JSON.parse(localStorage.getItem(NEST_IMPORT_LS) || 'null');
+    } catch (_) {
+        return null;
+    }
+}
+
+function nestImportSaveSession(s) {
+    try {
+        localStorage.setItem(NEST_IMPORT_LS, JSON.stringify({ ...s, updated_at: Date.now() }));
+    } catch (_) { /* quota / private mode */ }
+}
+
+function nestImportClearSession() {
+    try { localStorage.removeItem(NEST_IMPORT_LS); } catch (_) { /* */ }
+}
+
+function nestImportIsRetryable(err, status) {
+    if (status === 401 || status === 403 || status === 400 || status === 409 || status === 413) {
+        return false;
+    }
+    if (status === 502 || status === 503 || status === 504 || status === 408 || status === 429) {
+        return true;
+    }
+    if (status && status >= 500) return true;
+    const msg = String(err?.message || err || '').toLowerCase();
+    return (
+        msg.includes('failed to fetch')
+        || msg.includes('network')
+        || msg.includes('abort')
+        || msg.includes('timeout')
+        || msg.includes('load failed')
+        || msg.includes('connection')
+    );
+}
 
 /**
- * Nest import: multi-GB via sequential chunks (each < CF limit).
+ * Nest import: multi-GB via parallel chunks (each < CF limit).
+ * Resumable: server keeps chunks 48h; client retries + Wake Lock + localStorage.
  * Slice all parts before any await so Android File stays valid.
  */
 async function nestImportFromFile(file) {
@@ -2493,48 +2721,256 @@ async function nestImportFromFile(file) {
     for (let i = 0; i < chunks; i++) {
         parts.push(file.slice(i * NEST_IMPORT_CHUNK, Math.min(size, (i + 1) * NEST_IMPORT_CHUNK)));
     }
-    const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+
+    // Resume same file (name+size) with same upload_id if server still has chunks
+    let id = (typeof crypto !== 'undefined' && crypto.randomUUID)
         ? crypto.randomUUID()
         : `u${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
-    const sizeLabel = mb >= 1024 ? `${(mb / 1024).toFixed(2)} ГБ` : `${mb.toFixed(1)} МБ`;
-    setStatus(`Import: ${name} (${sizeLabel}, 1/${chunks})…`, 'busy');
-    toast('info', `Загрузка ${name} (${sizeLabel})…`);
-    logLine(`import start name=${name} size_mb=${mb.toFixed(2)} chunks=${chunks}`);
-    try {
-        let data = {};
-        for (let i = 0; i < chunks; i++) {
-            setStatus(`Import: ${name} · ${i + 1}/${chunks}…`, 'busy');
-            logLine(`import chunk ${i + 1}/${chunks}`);
-            const res = await fetch('/_nest/import', {
-                method: 'POST',
+    let haveSet = new Set();
+    const prev = nestImportLoadSession();
+    if (
+        prev
+        && prev.file_name === name
+        && Number(prev.file_size) === size
+        && Number(prev.chunks) === chunks
+        && prev.upload_id
+    ) {
+        id = String(prev.upload_id);
+        try {
+            const stRes = await fetch(`/_nest/import-status?id=${encodeURIComponent(id)}`, {
                 credentials: 'include',
-                headers: {
-                    'Content-Type': 'application/octet-stream',
-                    'X-Nest-Upload-Id': id,
-                    'X-Nest-Chunk': String(i),
-                    'X-Nest-Chunks': String(chunks),
-                },
-                body: parts[i],
+                headers: { Accept: 'application/json' },
             });
-            data = await res.json().catch(() => ({}));
-            if (!res.ok) {
-                const hint = data.error || `HTTP ${res.status}`;
-                throw new Error(res.status === 401 ? `${hint} — войдите снова` : hint);
+            const st = await stRes.json().catch(() => ({}));
+            if (stRes.ok && st.exists && Array.isArray(st.have)) {
+                haveSet = new Set(st.have.map((x) => Number(x)).filter((n) => Number.isFinite(n)));
+                logLine(`import resume id=${id} have=${haveSet.size}/${chunks}`);
+            } else {
+                logLine(`import status empty — fresh session id=${id}`);
             }
+        } catch (e) {
+            logLine(`import-status: ${e?.message || e} — continue`);
         }
+    }
+
+    nestImportSaveSession({
+        upload_id: id,
+        file_name: name,
+        file_size: size,
+        chunks,
+        chunk_size: NEST_IMPORT_CHUNK,
+    });
+
+    const sizeLabel = mb >= 1024 ? `${(mb / 1024).toFixed(2)} ГБ` : `${mb.toFixed(1)} МБ`;
+    const already = haveSet.size;
+    setStatus(
+        already
+            ? `Import: ${name} · resume ${already}/${chunks}…`
+            : `Import: ${name} (${sizeLabel}, 1/${chunks})…`,
+        'busy',
+    );
+    toast(
+        'info',
+        already
+            ? `Продолжаем ${name}: уже ${already}/${chunks} чанков на сервере`
+            : `Загрузка ${name} (${sizeLabel})… экран лучше не гасить`,
+    );
+    logLine(`import start name=${name} size_mb=${mb.toFixed(2)} chunks=${chunks} id=${id} resume_have=${already}`);
+
+    // Keep screen awake on mobile (best-effort; fails silently if denied)
+    let wakeLock = null;
+    const acquireWake = async () => {
+        try {
+            if (navigator.wakeLock && navigator.wakeLock.request) {
+                wakeLock = await navigator.wakeLock.request('screen');
+                wakeLock.addEventListener?.('release', () => { /* re-acquire on visibility */ });
+            }
+        } catch (_) { /* not supported / denied */ }
+    };
+    const onVis = () => {
+        if (document.visibilityState === 'visible') acquireWake();
+    };
+    await acquireWake();
+    try { document.addEventListener('visibilitychange', onVis); } catch (_) { /* */ }
+
+    const postChunk = async (i) => {
+        const headers = {
+            'Content-Type': 'application/octet-stream',
+            'X-Nest-Upload-Id': id,
+            'X-Nest-Chunk': String(i),
+            'X-Nest-Chunks': String(chunks),
+            'X-Nest-File-Size': String(size),
+        };
+        // ASCII-safe file name for header
+        try {
+            headers['X-Nest-File-Name'] = encodeURIComponent(name).slice(0, 200);
+        } catch (_) { /* */ }
+
+        let lastErr = null;
+        for (let attempt = 1; attempt <= NEST_IMPORT_CHUNK_RETRIES; attempt++) {
+            try {
+                const res = await fetch('/_nest/import', {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers,
+                    body: parts[i],
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    const hint = data.error || `HTTP ${res.status}`;
+                    const err = new Error(res.status === 401 ? `${hint} — войдите снова` : hint);
+                    err.status = res.status;
+                    if (!nestImportIsRetryable(err, res.status) || attempt === NEST_IMPORT_CHUNK_RETRIES) {
+                        throw err;
+                    }
+                    lastErr = err;
+                } else {
+                    return data;
+                }
+            } catch (e) {
+                lastErr = e;
+                const status = e?.status;
+                if (!nestImportIsRetryable(e, status) || attempt === NEST_IMPORT_CHUNK_RETRIES) {
+                    throw e;
+                }
+            }
+            // Exponential backoff: 1s, 2s, 4s… cap 30s (network blip / screen wake)
+            const delay = Math.min(30000, 1000 * (2 ** (attempt - 1)));
+            setStatus(
+                `Import: обрыв чанка ${i + 1}/${chunks}, повтор ${attempt}/${NEST_IMPORT_CHUNK_RETRIES} через ${Math.round(delay / 1000)}с…`,
+                'busy',
+            );
+            logLine(`import retry chunk=${i + 1} attempt=${attempt} wait_ms=${delay} err=${lastErr?.message || lastErr}`);
+            nestImportSaveSession({
+                upload_id: id,
+                file_name: name,
+                file_size: size,
+                chunks,
+                chunk_size: NEST_IMPORT_CHUNK,
+                last_chunk: i,
+            });
+            await nestImportSleep(delay);
+            if (document.visibilityState === 'visible') await acquireWake();
+        }
+        throw lastErr || new Error('chunk upload failed');
+    };
+
+    try {
+        // Which chunks still need upload; if all present, re-send last to trigger assemble
+        const need = [];
+        for (let i = 0; i < chunks; i++) {
+            if (!haveSet.has(i)) need.push(i);
+        }
+        if (need.length === 0 && chunks > 0) {
+            need.push(chunks - 1);
+            logLine('import all chunks on server — re-send last to assemble');
+        }
+
+        const conc = Math.min(nestImportConcurrency(), Math.max(1, need.length));
+        const t0 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        let liveBytes = 0;
+        logLine(`import parallel concurrency=${conc} queue=${need.length}`);
+
+        let data = {};
+        let doneCount = haveSet.size;
+        let nextIdx = 0;
+        let hardFail = null;
+        let finished = false;
+        const inFlight = new Set();
+
+        const bumpStatus = () => {
+            const pct = Math.min(99, Math.round((doneCount / chunks) * 100));
+            const elapsed = Math.max(0.001, (
+                ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - t0
+            ) / 1000);
+            const mibs = liveBytes / (1024 * 1024) / elapsed;
+            const speed = mibs >= 0.05 ? ` · ~${mibs.toFixed(1)} МиБ/с` : '';
+            const par = conc > 1 ? ` ×${inFlight.size || conc}` : '';
+            setStatus(`Import: ${name} · ${doneCount}/${chunks} (${pct}%)${par}${speed}`, 'busy');
+        };
+
+        const runOne = async (i) => {
+            inFlight.add(i);
+            bumpStatus();
+            logLine(`import chunk ${i + 1}/${chunks} (parallel)`);
+            try {
+                const chunkData = await postChunk(i);
+                liveBytes += parts[i]?.size || 0;
+                if (Array.isArray(chunkData.have_list)) {
+                    for (const h of chunkData.have_list) haveSet.add(Number(h));
+                    doneCount = Math.max(doneCount, haveSet.size);
+                } else {
+                    haveSet.add(i);
+                    doneCount = Math.max(doneCount, haveSet.size, Number(chunkData.have) || 0);
+                }
+                nestImportSaveSession({
+                    upload_id: id,
+                    file_name: name,
+                    file_size: size,
+                    chunks,
+                    chunk_size: NEST_IMPORT_CHUNK,
+                    last_ok_chunk: i,
+                });
+                if (chunkData.done) {
+                    data = chunkData;
+                    finished = true;
+                } else if (!finished) {
+                    data = chunkData;
+                }
+            } finally {
+                inFlight.delete(i);
+                bumpStatus();
+            }
+        };
+
+        const workers = Array.from({ length: conc }, async () => {
+            while (!hardFail && !finished) {
+                const my = nextIdx++;
+                if (my >= need.length) return;
+                try {
+                    await runOne(need[my]);
+                } catch (e) {
+                    hardFail = e;
+                    return;
+                }
+            }
+        });
+        await Promise.all(workers);
+
+        if (hardFail) throw hardFail;
+
         if (!data.done && data.files == null) {
-            throw new Error(data.error || 'upload incomplete');
+            throw new Error(data.error || 'upload incomplete — выберите тот же файл ещё раз, загрузка продолжится');
         }
-        setStatus(`Import: ${data.files || 0} files (${data.format || '?'}) → ${data.handle}`, 'ok');
+        nestImportClearSession();
+        const elapsed = Math.max(0.001, (
+            ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - t0
+        ) / 1000);
+        const avg = (liveBytes / (1024 * 1024) / elapsed).toFixed(1);
+        setStatus(`Import: ${data.files || 0} files (${data.format || '?'}) → ${data.handle} · ${avg} МиБ/с`, 'ok');
         toast('success', 'Импорт готов — reload');
-        logLine(`import ok files=${data.files} format=${data.format} chunks=${chunks}`);
+        logLine(`import ok files=${data.files} format=${data.format} chunks=${chunks} conc=${conc} avg_mib_s=${avg}`);
         refreshNestUsage();
         setTimeout(() => { try { location.reload(); } catch (_) { /* */ } }, 1200);
     } catch (e) {
         const msg = e?.message || String(e);
-        setStatus(`Import: ${msg}`, 'err');
-        toast('error', msg);
-        logLine(`import: ${msg}`);
+        const permanent = /unsupported|invalid (zip|tar|header|json)|not an ST|empty |gzip decompress|нужен ST backup|JSON pack пуст|Bad magic|not a gzip|WuCloud JSON/i.test(msg);
+        // Always drop resume on 4xx format problems so we don't skip-reupload forever
+        if (permanent || /invalid header/i.test(msg)) {
+            nestImportClearSession();
+            const hint = /invalid header|gzip|json/i.test(msg)
+                ? ' Это не ST zip (часто WuCloud JSON.gz). Нажмите «Из облака» или Push полный Backup zip с локальной ST.'
+                : '';
+            setStatus(`Import: ${msg}`, 'err');
+            toast('error', msg + hint);
+        } else {
+            setStatus(`Import: ${msg} (можно выбрать тот же файл — продолжим)`, 'err');
+            toast('error', `${msg}. Выберите тот же файл снова — с места обрыва.`);
+        }
+        logLine(`import: ${msg}${permanent || /invalid header/i.test(msg) ? ' (session cleared)' : ''}`);
+    } finally {
+        try { document.removeEventListener('visibilitychange', onVis); } catch (_) { /* */ }
+        try { await wakeLock?.release?.(); } catch (_) { /* */ }
     }
 }
 
@@ -2569,15 +3005,117 @@ function applyManagedUi() {
     }
 }
 
-/** Bind Nest export/import. Label+overlay input only (no synthetic click). */
+/**
+ * Nest: apply latest WuCloud pack from server disk (no browser re-upload).
+ * Avoids «invalid header» when local ST pushed JSON.gz fallback and the user
+ * re-uploads a corrupted/misread download.
+ */
+async function nestImportFromCloudPack() {
+    if (!isNestMode()) {
+        toast('warning', 'Import из облака только на Nest');
+        return;
+    }
+    nestImportClearSession();
+    setStatus('Import: pack из WuCloud…', 'busy');
+    logLine('import-cloud: start');
+    try {
+        const res = await fetch('/_nest/import-cloud', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: '{}',
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            throw new Error(data.error || `HTTP ${res.status}`);
+        }
+        setStatus(
+            `Import cloud: ${data.files || 0} files (${data.format || '?'}) · ${data.source_file || ''}`,
+            'ok',
+        );
+        toast('success', `Из облака: ${data.files || 0} файлов — reload`);
+        logLine(`import-cloud ok files=${data.files} format=${data.format} src=${data.source_file}`);
+        refreshNestUsage();
+        setTimeout(() => { try { location.reload(); } catch (_) { /* */ } }, 1200);
+        return data;
+    } catch (e) {
+        const msg = e?.message || String(e);
+        setStatus(`Import cloud: ${msg}`, 'err');
+        toast('error', msg);
+        logLine(`import-cloud: ${msg}`);
+        throw e;
+    }
+}
+
+/** Full wipe of Nest home via nestmgr POST /_nest/wipe (reusable API). */
+async function nestWipeAllData() {
+    if (!isNestMode()) {
+        toast('warning', 'Wipe только на Nest');
+        return;
+    }
+    const ok1 = window.confirm(
+        'Полная очистка Nest?\n\n'
+        + 'Будут удалены ВСЕ данные data/wu-*:\n'
+        + '• чаты, персонажи, worlds, extensions\n'
+        + '• settings.json, secrets, ST backups\n'
+        + '• freeze-архив (если был)\n\n'
+        + 'WuAuth-аккаунт останется. Действие необратимо.',
+    );
+    if (!ok1) return;
+    const typed = window.prompt(
+        'Чтобы подтвердить, введите точно:\nWIPE_MY_NEST',
+        '',
+    );
+    if (typed !== 'WIPE_MY_NEST') {
+        toast('info', 'Wipe отменён');
+        return;
+    }
+    setStatus('Wipe Nest data…', 'busy');
+    logLine('wipe: confirm=WIPE_MY_NEST');
+    try {
+        const res = await fetch('/_nest/wipe', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ confirm: 'WIPE_MY_NEST', delete_archive: true }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            throw new Error(data.error || `HTTP ${res.status}`);
+        }
+        const mb = (Number(data.bytes_before || 0) / (1024 * 1024)).toFixed(1);
+        setStatus(`Wipe ok · ${data.handle} · was ${mb} MiB`, 'ok');
+        toast('success', `Nest очищен (${data.handle}). Reload…`);
+        logLine(`wipe ok handle=${data.handle} bytes_before=${data.bytes_before} dirs=${data.removed_dirs}`);
+        setTimeout(() => {
+            try { location.reload(); } catch (_) { /* */ }
+        }, 900);
+    } catch (e) {
+        const msg = e?.message || String(e);
+        setStatus(`Wipe: ${msg}`, 'err');
+        toast('error', msg);
+        logLine(`wipe: ${msg}`);
+    }
+}
+
+/** Bind Nest export/import/wipe. Label+overlay input only (no synthetic click). */
 function wireNestImportExport() {
     const exp = document.getElementById('wucloud_nest_export');
     const file = document.getElementById('wucloud_nest_import_file');
+    const cloud = document.getElementById('wucloud_nest_import_cloud');
+    const wipe = document.getElementById('wucloud_nest_wipe');
     if (exp && !exp.dataset.bound) {
         exp.dataset.bound = '1';
         exp.addEventListener('click', (ev) => {
             ev.preventDefault();
             nestExportZip();
+        });
+    }
+    if (cloud && !cloud.dataset.bound) {
+        cloud.dataset.bound = '1';
+        cloud.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            nestImportFromCloudPack().catch(() => {});
         });
     }
     if (file && !file.dataset.bound) {
@@ -2594,6 +3132,13 @@ function wireNestImportExport() {
                 try { file.value = ''; } catch (_) { /* */ }
                 busy = false;
             });
+        });
+    }
+    if (wipe && !wipe.dataset.bound) {
+        wipe.dataset.bound = '1';
+        wipe.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            nestWipeAllData();
         });
     }
 }
@@ -2649,8 +3194,44 @@ async function init() {
     console.log(LOG_PREFIX, `loaded v${EXT_VERSION} mode=${mode}`);
 }
 
+/**
+ * Boot after ST is ready when possible (ST 1.15+ APP_READY).
+ * Avoids racing settings/UI before multi-user session hydrate.
+ */
+function bootWuCloud() {
+    const run = () => {
+        try {
+            if (typeof jQuery === 'function') jQuery(init);
+            else init().catch((e) => console.error(LOG_PREFIX, e));
+        } catch (e) {
+            console.error(LOG_PREFIX, 'boot', e);
+        }
+    };
+    try {
+        const c = ctx();
+        const es = c.eventSource;
+        const et = c.event_types || c.eventTypes || {};
+        const ready = et.APP_READY || et.SETTINGS_LOADED || 'app_ready';
+        if (es && typeof es.once === 'function' && ready) {
+            let done = false;
+            const once = () => {
+                if (done) return;
+                done = true;
+                run();
+            };
+            es.once(ready, once);
+            // Fallback if event already fired
+            setTimeout(() => {
+                if (!done) once();
+            }, 2500);
+            return;
+        }
+    } catch (_) { /* fall through */ }
+    run();
+}
+
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => jQuery(init));
+    document.addEventListener('DOMContentLoaded', bootWuCloud);
 } else {
-    jQuery(init);
+    bootWuCloud();
 }

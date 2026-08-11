@@ -1,7 +1,7 @@
 <div id="wucloud-sync-panel" class="wucloud-panel">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b><i class="fa-solid fa-cloud"></i> WuCloud <span class="wucloud-ver-badge" id="wucloud_ver_badge">0.10.9</span>
+            <b><i class="fa-solid fa-cloud"></i> WuCloud <span class="wucloud-ver-badge" id="wucloud_ver_badge">0.14.4</span>
                 <span id="wucloud_mode_badge" class="wucloud-mode-badge">…</span></b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
@@ -27,10 +27,29 @@
                         <!-- Android: never use button→input.click(). Label/for or overlay input is required
                              so the tap is a real user gesture on <input type=file>. No accept= filter —
                              Android often marks .zip as application/octet-stream and greys them out. -->
-                        <label id="wucloud_nest_import" class="menu_button wucloud-file-label" for="wucloud_nest_import_file" title="Распаковать ST backup (.zip или .tar.gz) в data/wu-*">
+                        <button id="wucloud_nest_import_cloud" class="menu_button" type="button" title="Взять последний pack из WuCloud (без загрузки файла)">
+                            <i class="fa-solid fa-cloud-arrow-down"></i> Из облака
+                        </button>
+                        <label id="wucloud_nest_import" class="menu_button wucloud-file-label" for="wucloud_nest_import_file" title="Распаковать ST backup (.zip / .tar.gz / WuCloud pack) в data/wu-*">
                             <i class="fa-solid fa-file-import"></i> Import
                             <input type="file" id="wucloud_nest_import_file" class="wucloud-file-input" />
                         </label>
+                    </div>
+                    <div class="wucloud-danger-zone">
+                        <div class="wucloud-section-title" style="color:#fca5a5">Опасная зона</div>
+                        <p class="wucloud-hint">
+                            <b>Полная очистка Nest</b> удаляет <b>всё</b> в <code>data/wu-*</code>:
+                            чаты, персонажи, бэкапы ST, settings, extensions, worlds…
+                            Аккаунт WuAuth остаётся. После wipe — чистый Nest + stock seed.
+                            API: <code>POST /_nest/wipe</code> с
+                            <code>{"confirm":"WIPE_MY_NEST"}</code>.
+                        </p>
+                        <div class="wucloud-buttons">
+                            <button type="button" id="wucloud_nest_wipe" class="menu_button wucloud-stop-btn"
+                                title="Полностью очистить data/wu-* (необратимо)">
+                                <i class="fa-solid fa-skull-crossbones"></i> Wipe all Nest data
+                            </button>
+                        </div>
                     </div>
                     <div class="wucloud-managed__links">
                         <a href="https://nest.wuproj.com/portal" target="_blank" rel="noopener">Портал / квота</a>
@@ -38,8 +57,9 @@
                         <a href="https://wuproj.com/gold" target="_blank" rel="noopener">wu-gold</a>
                     </div>
                     <p class="wucloud-hint" style="margin-top:8px">
-                        Export = ST <code>.zip</code>. Import принимает <b>.zip</b> (ПК) и <b>.tar.gz</b> (Android ST).
-                        Нужен <b>файл</b>, не папка. После импорта — reload.
+                        <b>Из облака</b> = последний WuCloud pack с сервера (рекомендуется после Push с локальной ST).
+                        Import файла: <b>.zip</b> / <b>.tar.gz</b> / WuCloud <b>.json.gz</b>.
+                        После импорта — hard reload.
                     </p>
                 </div>
 
@@ -112,7 +132,7 @@
                 <pre id="wucloud_log" class="wucloud-log" aria-live="polite"></pre>
 
                 <div class="wucloud-foot">
-                    <span id="wucloud_ver_foot">v0.10.9 · Phase 2 packs</span>
+                    <span id="wucloud_ver_foot">v0.11.0 · Phase 2 packs · ST 1.18</span>
                     ·
                     <a href="https://github.com/shastitko1970-netizen/wucloud-sync" target="_blank" rel="noopener">GitHub</a>
                     ·
