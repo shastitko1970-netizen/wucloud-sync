@@ -11,8 +11,9 @@
                 <div id="wucloud_managed_banner" class="wucloud-managed" style="display:none;">
                     <div class="wucloud-managed__title">◆ Nest companion</div>
                     <p class="wucloud-managed__body">
-                        Live-данные = <code>data/wu-*</code>. Cloud Push/Pull <b>выкл</b>.
-                        LLM: <b>WuProj</b> → <code>eco.wuproj.com/v1</code> · <code>openai/gpt-5.4-nano</code>.
+                        Чаты живут <b>в этой таверне на диске</b>. Облако WuProj — не live-копия.
+                        Cloud Push/Pull <b>выкл</b>. Главное действие — <b>Export zip</b> на свой компьютер.
+                        LLM: <b>WuProj</b> → eco · <code>openai/gpt-5.4-nano</code>.
                     </p>
                     <p id="wucloud_managed_key_status" class="wucloud-managed__status">…</p>
                     <div class="wucloud-quota">
@@ -30,7 +31,7 @@
                         <button id="wucloud_nest_import_cloud" class="menu_button" type="button" title="Взять последний pack из WuCloud (без загрузки файла)">
                             <i class="fa-solid fa-cloud-arrow-down"></i> Из облака
                         </button>
-                        <label id="wucloud_nest_import" class="menu_button wucloud-file-label" for="wucloud_nest_import_file" title="Распаковать ST backup (.zip / .tar.gz / WuCloud pack) в data/wu-*">
+                        <label id="wucloud_nest_import" class="menu_button wucloud-file-label" for="wucloud_nest_import_file" title="Распаковать ST backup (.zip / .tar.gz / WuCloud pack) в дом Nest">
                             <i class="fa-solid fa-file-import"></i> Import
                             <input type="file" id="wucloud_nest_import_file" class="wucloud-file-input" />
                         </label>
@@ -38,15 +39,13 @@
                     <div class="wucloud-danger-zone">
                         <div class="wucloud-section-title" style="color:#fca5a5">Опасная зона</div>
                         <p class="wucloud-hint">
-                            <b>Полная очистка Nest</b> удаляет <b>всё</b> в <code>data/wu-*</code>:
-                            чаты, персонажи, бэкапы ST, settings, extensions, worlds…
+                            <b>Полная очистка Nest</b> удаляет <b>всё</b> в доме: чаты,
+                            персонажи, бэкапы ST, settings, extensions, worlds…
                             Аккаунт WuAuth остаётся. После wipe — чистый Nest + stock seed.
-                            API: <code>POST /_nest/wipe</code> с
-                            <code>{"confirm":"WIPE_MY_NEST"}</code>.
                         </p>
                         <div class="wucloud-buttons">
                             <button type="button" id="wucloud_nest_wipe" class="menu_button wucloud-stop-btn"
-                                title="Полностью очистить data/wu-* (необратимо)">
+                                title="Полностью очистить дом Nest (необратимо)">
                                 <i class="fa-solid fa-skull-crossbones"></i> Wipe all Nest data
                             </button>
                         </div>

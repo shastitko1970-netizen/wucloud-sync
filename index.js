@@ -10,13 +10,26 @@
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
  */
 import { getContext, extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
-import { getRequestHeaders as stGetRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
+import { getRequestHeaders as stGetRequestHeaders, saveSettingsDebounced, saveChatConditional, saveSettings, isChatSaving } from '../../../../script.js';
+import { shouldFlushChat, chatLoadedAfterEvent } from './flush-guard.js';
 
 const MODULE = 'wucloud-sync';
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.14.6';
+const EXT_VERSION = '0.14.7';
+
+/** True after a successful chat load this session (see chatLoadedAfterEvent). */
+let chatLoadedThisSession = false;
+/** Entity that last completed load — mid-switch this_chid / selected_group already moved. */
+let loadedThisChid = undefined;
+let loadedSelectedGroup = undefined;
+/** True after our bootstrap hydrated settings — flush settings.json on leave. */
+let settingsHydrated = false;
+/** GENERATION_STARTED … ENDED/STOPPED — do not flush a truncated stream. */
+let generationInFlight = false;
+let leaveFlushInFlight = false;
+let lastLeaveFlushAt = 0;
 
 /** @typedef {'external' | 'nest'} WuCloudMode */
 
@@ -2549,6 +2562,81 @@ function ensureNestLocaleDefault() {
     } catch (_) { /* ignore */ }
 }
 
+function rememberLoadedEntity(c, loaded) {
+    if (!loaded) {
+        loadedThisChid = undefined;
+        loadedSelectedGroup = undefined;
+        return;
+    }
+    loadedThisChid = c.characterId ?? c.this_chid;
+    loadedSelectedGroup = c.groupId ?? c.selected_group;
+}
+
+function isStreamingNow() {
+    if (generationInFlight) {
+        return true;
+    }
+    try {
+        const c = ctx();
+        const sp = c.streamingProcessor;
+        if (sp && (sp.isFinished === false || sp.isRunning === true || sp.running === true)) {
+            return true;
+        }
+    } catch (_) { /* ignore */ }
+    return false;
+}
+
+async function flushOnLeave() {
+    const now = Date.now();
+    if (leaveFlushInFlight || (now - lastLeaveFlushAt) < 1500) {
+        return;
+    }
+    leaveFlushInFlight = true;
+    lastLeaveFlushAt = now;
+    try {
+        const c = ctx();
+        if (shouldFlushChat({
+            thisChid: c.characterId ?? c.this_chid,
+            selectedGroup: c.groupId ?? c.selected_group,
+            loadedThisChid,
+            loadedSelectedGroup,
+            chatLoaded: chatLoadedThisSession,
+            isChatSaving: !!isChatSaving,
+            isStreaming: isStreamingNow(),
+        })) {
+            try {
+                await saveChatConditional();
+            } catch (e) {
+                console.warn(LOG_PREFIX, 'leave flush chat failed', e);
+            }
+        }
+        if (settingsHydrated) {
+            try {
+                await saveSettings();
+            } catch (e) {
+                console.warn(LOG_PREFIX, 'leave flush settings failed', e);
+            }
+        }
+    } finally {
+        leaveFlushInFlight = false;
+    }
+}
+
+function bindLeaveFlush() {
+    if (typeof window === 'undefined' || window.__wucloudLeaveFlush) {
+        return;
+    }
+    window.__wucloudLeaveFlush = true;
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+            void flushOnLeave();
+        }
+    });
+    window.addEventListener('pagehide', () => {
+        void flushOnLeave();
+    });
+}
+
 function bindEvents() {
     const c = ctx();
     const es = c.eventSource;
@@ -2564,6 +2652,40 @@ function bindEvents() {
     ].filter(Boolean);
     for (const t of types) {
         try { es.on(t, bump); } catch (_) { /* ignore */ }
+    }
+    if (et.CHAT_CHANGED) {
+        try {
+            es.on(et.CHAT_CHANGED, () => {
+                const c2 = ctx();
+                const g = c2.groupId ?? c2.selected_group;
+                const hasGroup = g !== undefined && g !== null && g !== '';
+                chatLoadedThisSession = chatLoadedAfterEvent('changed', hasGroup);
+                rememberLoadedEntity(c2, chatLoadedThisSession);
+            });
+        } catch (_) { /* ignore */ }
+    }
+    // ST 1.18 events.js: CHAT_LOADED: 'chatLoaded'. Bind the string too if the
+    // context copy omits the key (groups still rely on CHAT_CHANGED above).
+    const chatLoadedEvt = et.CHAT_LOADED || 'chatLoaded';
+    try {
+        es.on(chatLoadedEvt, () => {
+            chatLoadedThisSession = chatLoadedAfterEvent('loaded', false);
+            rememberLoadedEntity(ctx(), chatLoadedThisSession);
+        });
+    } catch (_) { /* ignore */ }
+    if (et.GENERATION_STARTED) {
+        try {
+            es.on(et.GENERATION_STARTED, () => {
+                generationInFlight = true;
+            });
+        } catch (_) { /* ignore */ }
+    }
+    for (const done of [et.GENERATION_ENDED, et.GENERATION_STOPPED].filter(Boolean)) {
+        try {
+            es.on(done, () => {
+                generationInFlight = false;
+            });
+        } catch (_) { /* ignore */ }
     }
     // Apply selected theme after settings hydrate (importTheme does not apply).
     const loaded = et.SETTINGS_LOADED || et.SETTINGS_LOADED_AFTER || et.APP_READY;
@@ -2708,7 +2830,7 @@ function assertExternalBridge(action) {
     if (!isNestMode()) return true;
     const msg = `Nest companion: «${action}» отключён — данные уже в таверне, без дубля в PG`;
     logLine(msg);
-    setStatus('Nest: без cloud sync (Phase 0)', 'ok');
+    setStatus('Nest: без cloud sync', 'ok');
     try {
         toast('info', 'На Nest live-данные в ST. Cloud Push/Pull не нужен.');
     } catch (_) { /* ignore */ }
@@ -3200,7 +3322,7 @@ function applyManagedUi() {
         modeBadge.classList.toggle('is-ext', !nest);
     }
     if (status && nest) {
-        status.textContent = 'Live: ST data/wu-* · BYTEA sync OFF · LLM: WuProj / eco';
+        status.textContent = 'Чаты на диске этой таверны. Облако — не live-копия. Сначала Export zip.';
         status.classList.add('is-ok');
         status.classList.remove('is-bad');
     }
@@ -3265,7 +3387,7 @@ async function nestWipeAllData() {
     }
     const ok1 = window.confirm(
         'Полная очистка Nest?\n\n'
-        + 'Будут удалены ВСЕ данные data/wu-*:\n'
+        + 'Будут удалены ВСЕ данные дома:\n'
         + '• чаты, персонажи, worlds, extensions\n'
         + '• settings.json, secrets, ST backups\n'
         + '• freeze-архив (если был)\n\n'
@@ -3388,6 +3510,8 @@ async function init() {
     } catch (_) { /* ignore */ }
     ensureNestLocaleDefault();
     bindEvents();
+    bindLeaveFlush();
+    settingsHydrated = true;
     setupIntervalAutosave();
     // Late reapply if settings already loaded before our handlers bound
     setTimeout(() => reapplySelectedTheme('init'), 800);
