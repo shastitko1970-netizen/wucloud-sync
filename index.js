@@ -1,23 +1,62 @@
 /**
- * WuCloud — SillyTavern extension v0.11 (ST 1.15+ / Nest 1.18)
+ * WuCloud — SillyTavern extension (ST 1.15+ / Nest 1.18)
  *
- * Two modes (see docs/WUCLOUD.md):
+ * Two modes:
  *   external  — bridge: local/foreign ST ↔ WuApi packs (zip object store)
- *   nest      — companion on nest.wuproj.com: live data is ST disk only; NO cloud Push/Pull
+ *   nest      — companion on Nest hosts: live data is ST disk only; NO cloud Push/Pull
  *
- * Phase 2: Push/Pull = full ST data pack, not dual-model component blobs.
- * ST 1.18: prefer SillyTavern.getContext() (getWorldInfoNames, getRequestHeaders, events).
+ * Nest hosts: nest.wuproj.com, st.wuproj.com, tavern.wuproj.com
  * Install: Extensions → Install extension → https://github.com/shastitko1970-netizen/wucloud-sync
+ *
+ * Sibling product NestCloud (apps/nest-cloud) is the same code branded for Nest;
+ * Nest servers preinstall only nest-cloud — not both.
  */
 import { getContext, extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
-import { getRequestHeaders as stGetRequestHeaders, saveSettingsDebounced, saveChatConditional, saveSettings, isChatSaving } from '../../../../script.js';
-import { shouldFlushChat, chatLoadedAfterEvent } from './flush-guard.js';
+import { getRequestHeaders as stGetRequestHeaders, saveSettingsDebounced, saveChatConditional, saveSettings, isChatSaving, createOrEditCharacter } from '../../../../script.js';
+import { editGroup } from '../../../group-chats.js';
+import { selected_world_info, world_info, loadWorldInfo, saveWorldInfo } from '../../../world-info.js';
+import {
+    shouldFlushChat,
+    shouldRunNestDiskAutosave,
+    shouldAutosaveNestSettings,
+    leaveFlushStartAction,
+    NEST_DISK_AUTOSAVE_MS,
+    chatLoadedAfterEvent,
+    shouldSaveCharacterCard,
+    shouldSaveGroupMeta,
+    worldNamesToFlush,
+} from './flush-guard.js';
+import {
+    DISK_TOAST_ID,
+    SESSION_OVERLAY_ID,
+    csrfHintInBody,
+    isMutatingHttpMethod,
+    isSameOriginUrl,
+    isStCsrfFailClosedPath,
+    isWuGatewayPath,
+    nestDiskFingerprintChanged,
+    openHomeDiskFingerprint,
+    requestPathname,
+    shouldShowSessionOverlay,
+    shouldToastNestDiskAutosave,
+} from './csrf-guard.js';
 
+/** Extension folder / settings key. NestCloud emit rewrites to nest-cloud. */
 const MODULE = 'wucloud-sync';
+const PRODUCT_LABEL = 'WuCloud';
+const GITHUB_HOME = 'https://github.com/shastitko1970-netizen/wucloud-sync';
+/** Hostnames where this build auto-enters Nest companion mode (no cloud Push/Pull). */
+const NEST_MANAGED_HOSTS = Object.freeze([
+    'nest.wuproj.com',
+    'st.wuproj.com',
+    'tavern.wuproj.com',
+]);
+/** Both cloud products — never push each other as a third-party dependency. */
+const CLOUD_SIBLING_MODULES = Object.freeze(['wucloud-sync', 'nest-cloud']);
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.14.7';
+const EXT_VERSION = '0.14.12';
 
 /** True after a successful chat load this session (see chatLoadedAfterEvent). */
 let chatLoadedThisSession = false;
@@ -29,7 +68,20 @@ let settingsHydrated = false;
 /** GENERATION_STARTED … ENDED/STOPPED — do not flush a truncated stream. */
 let generationInFlight = false;
 let leaveFlushInFlight = false;
+/** Hide/pagehide arrived while persist held the mutex — retry after release. */
+let leaveFlushPending = false;
+/** Hide+pagehide burst debounce only. Save Now must not write this. */
 let lastLeaveFlushAt = 0;
+/** Longest in-memory chat length seen for the loaded entity this session. */
+let lastKnownChatLength = 0;
+/** Last successful saveSettings from companion persist (Nest 10 MiB settings.json). */
+let lastSettingsPersistAt = 0;
+/** Last disk fingerprint we already persisted (autosave or Save Now). */
+let lastDiskFingerprint = '';
+/** Last quiet «Дом на диске» toast (ms). */
+let lastDiskToastAt = 0;
+/** Hide timer for the quiet disk toast node. */
+let diskToastHideTimer = 0;
 
 /** @typedef {'external' | 'nest'} WuCloudMode */
 
@@ -66,6 +118,7 @@ let mapDirty = false;
 let mapSaveTimer = null;
 let autosaveTimer = null;
 let intervalHandle = null;
+let nestDiskAutosaveKickTimer = null;
 let pushInFlight = false;
 let pushAbort = null;
 
@@ -732,7 +785,7 @@ async function collectThirdPartyExtensions() {
         const rawName = String(e.name || '');
         if (!rawName.includes('third-party/') && e.type !== 'local' && e.type !== 'global') continue;
         const folder = rawName.replace(/^third-party\//, '').replace(/\\/g, '/').split('/').filter(Boolean).pop();
-        if (!folder || folder === 'wucloud-sync') continue; // Nest seeds companion separately
+        if (!folder || CLOUD_SIBLING_MODULES.includes(folder)) continue; // Nest seeds companion separately
 
         let remoteUrl = '';
         let displayName = '';
@@ -2498,12 +2551,252 @@ function scheduleAutosave() {
     return;
 }
 
+function isSessionOverlayVisible() {
+    try {
+        return !!(typeof document !== 'undefined' && document.getElementById(SESSION_OVERLAY_ID));
+    } catch (_) {
+        return false;
+    }
+}
+
+function fetchRequestMeta(input, init) {
+    let url = '';
+    let method = 'GET';
+    try {
+        if (typeof Request !== 'undefined' && input instanceof Request) {
+            url = input.url;
+            method = input.method || 'GET';
+        } else if (typeof input === 'string') {
+            url = input;
+        } else if (input && typeof input.url === 'string') {
+            url = input.url;
+        }
+        if (init && init.method) method = init.method;
+    } catch (_) { /* ignore */ }
+    return { url, method };
+}
+
+function inspectCsrfStatus({ status, method, url, csrfHint }) {
+    try {
+        const origin = typeof location !== 'undefined' ? location.origin : '';
+        const pathname = requestPathname(url, origin);
+        if (shouldShowSessionOverlay({
+            alreadyVisible: isSessionOverlayVisible(),
+            status,
+            sameOrigin: isSameOriginUrl(url, origin),
+            pathname,
+            mutating: isMutatingHttpMethod(method),
+            csrfHint: !!csrfHint,
+        })) {
+            showSessionOverlay();
+        }
+    } catch (_) { /* never break ST */ }
+}
+
+async function inspectFetchCsrf(res, input, init) {
+    if (!res || res.status !== 403) return;
+    const { url, method } = fetchRequestMeta(input, init);
+    const origin = typeof location !== 'undefined' ? location.origin : '';
+    const pathname = requestPathname(url, origin);
+    let csrfHint = false;
+    if (!isStCsrfFailClosedPath(pathname) && !isWuGatewayPath(pathname)) {
+        try {
+            const text = await res.clone().text();
+            csrfHint = csrfHintInBody(text.slice(0, 2000));
+        } catch (_) {
+            csrfHint = false;
+        }
+    }
+    inspectCsrfStatus({ status: res.status, method, url, csrfHint });
+}
+
+function showSessionOverlay() {
+    if (typeof document === 'undefined' || !document.body) return;
+    if (isSessionOverlayVisible()) return;
+    const root = document.createElement('div');
+    root.id = SESSION_OVERLAY_ID;
+    root.className = 'wucloud-session-overlay';
+    root.setAttribute('role', 'alertdialog');
+    root.setAttribute('aria-modal', 'true');
+    root.setAttribute('aria-labelledby', 'wucloud-session-overlay-title');
+    root.innerHTML = '<div class="wucloud-session-overlay__card">'
+        + '<p class="wucloud-session-overlay__kicker">WuNest · сессия</p>'
+        + '<h2 class="wucloud-session-overlay__title" id="wucloud-session-overlay-title">Сессия таверны обновилась</h2>'
+        + '<p class="wucloud-session-overlay__body">Эта вкладка держит старый ключ. Сохранение сейчас молчит. '
+        + 'Обнови страницу — дом на диске подхватится заново.</p>'
+        + '<button type="button" class="wucloud-session-overlay__reload" id="wucloud-session-overlay-reload">'
+        + 'Обновить страницу</button>'
+        + '</div>';
+    document.body.appendChild(root);
+    const btn = document.getElementById('wucloud-session-overlay-reload');
+    if (btn) {
+        btn.addEventListener('click', () => {
+            btn.disabled = true;
+            try { location.reload(); } catch (_) { /* ignore */ }
+        });
+        try { btn.focus(); } catch (_) { /* ignore */ }
+    }
+    logLine('session overlay: CSRF 403 — refresh required');
+}
+
+function currentDiskFingerprint() {
+    const c = ctx();
+    const snap = openHomeSnapshot(c);
+    let lastMesLen = 0;
+    let lastSend = '';
+    try {
+        const chat = c?.chat;
+        if (Array.isArray(chat) && chat.length) {
+            const last = chat[chat.length - 1];
+            lastMesLen = String(last?.mes ?? '').length;
+            lastSend = String(last?.send_date ?? '');
+        }
+    } catch (_) { /* ignore */ }
+    return openHomeDiskFingerprint({
+        thisChid: snap.thisChid,
+        selectedGroup: snap.selectedGroup,
+        chatLength: snap.chatLength,
+        lastMesLen,
+        lastSend,
+        settingsAt: lastSettingsPersistAt,
+    });
+}
+
+function showDiskToast() {
+    if (typeof document === 'undefined' || !document.body) return;
+    if (isSessionOverlayVisible()) return;
+    let el = document.getElementById(DISK_TOAST_ID);
+    if (!el) {
+        el = document.createElement('div');
+        el.id = DISK_TOAST_ID;
+        el.className = 'wucloud-disk-toast';
+        el.setAttribute('role', 'status');
+        document.body.appendChild(el);
+    }
+    el.textContent = 'Дом на диске';
+    el.classList.add('is-on');
+    if (diskToastHideTimer) clearTimeout(diskToastHideTimer);
+    diskToastHideTimer = setTimeout(() => {
+        el.classList.remove('is-on');
+        diskToastHideTimer = 0;
+    }, 2400);
+}
+
+function noteDiskFingerprint() {
+    try {
+        lastDiskFingerprint = currentDiskFingerprint();
+    } catch (_) { /* ignore */ }
+}
+
+function maybeToastDiskAutosave(result) {
+    try {
+        const persistOk = !!result?.ok;
+        const fp = currentDiskFingerprint();
+        const show = shouldToastNestDiskAutosave({
+            source: 'autosave',
+            includeExtras: !!result?.includeExtras,
+            overlayVisible: isSessionOverlayVisible(),
+            fingerprintChanged: nestDiskFingerprintChanged(lastDiskFingerprint, fp),
+            persistOk,
+            lastToastAt: lastDiskToastAt,
+            now: Date.now(),
+        });
+        if (persistOk) {
+            lastDiskFingerprint = fp;
+        }
+        if (!show) return;
+        lastDiskToastAt = Date.now();
+        showDiskToast();
+    } catch (_) { /* ignore */ }
+}
+
+function installSessionCsrfWatch() {
+    if (typeof window === 'undefined' || window.__wucloudCsrfWatch) return;
+    window.__wucloudCsrfWatch = true;
+    const origFetch = window.fetch.bind(window);
+    window.fetch = function wucloudFetch(input, init) {
+        return origFetch(input, init).then((res) => {
+            try { void inspectFetchCsrf(res, input, init); } catch (_) { /* ignore */ }
+            return res;
+        });
+    };
+    const proto = XMLHttpRequest.prototype;
+    const origOpen = proto.open;
+    const origSend = proto.send;
+    proto.open = function wucloudXhrOpen(method, url, ...rest) {
+        try {
+            this.__wucloudXhr = { method, url: String(url || '') };
+        } catch (_) { /* ignore */ }
+        return origOpen.call(this, method, url, ...rest);
+    };
+    proto.send = function wucloudXhrSend(...args) {
+        this.addEventListener('loadend', function wucloudXhrEnd() {
+            try {
+                const meta = this.__wucloudXhr || {};
+                const url = this.responseURL || meta.url || '';
+                const method = meta.method || 'GET';
+                if (this.status !== 403) return;
+                const origin = location.origin;
+                const pathname = requestPathname(url, origin);
+                let csrfHint = false;
+                if (!isStCsrfFailClosedPath(pathname) && !isWuGatewayPath(pathname)) {
+                    try {
+                        const raw = typeof this.responseText === 'string' ? this.responseText : '';
+                        csrfHint = csrfHintInBody(raw.slice(0, 2000));
+                    } catch (_) {
+                        csrfHint = false;
+                    }
+                }
+                inspectCsrfStatus({ status: this.status, method, url, csrfHint });
+            } catch (_) { /* ignore */ }
+        });
+        return origSend.apply(this, args);
+    };
+}
+
+function nestDiskAutosaveTick() {
+    const visible = typeof document === 'undefined'
+        || document.visibilityState === 'visible';
+    if (!shouldRunNestDiskAutosave({
+        nestMode: isNestMode(),
+        settingsHydrated,
+        busy: leaveFlushInFlight,
+        visible,
+        isStreaming: isStreamingNow(),
+        isChatSaving: !!isChatSaving,
+    })) {
+        return;
+    }
+    leaveFlushInFlight = true;
+    const persistSettings = shouldAutosaveNestSettings(lastSettingsPersistAt);
+    persistOpenHomeNow({ includeExtras: true, persistSettings })
+        .then((result) => {
+            logLine('nest disk autosave: open home → ST disk (same as Сохранить сейчас)');
+            maybeToastDiskAutosave(result);
+        })
+        .catch((e) => {
+            console.warn(LOG_PREFIX, 'nest disk autosave failed', e);
+        })
+        .finally(() => {
+            releaseLeaveFlushMutex();
+        });
+}
+
 function setupIntervalAutosave() {
     if (intervalHandle) {
         clearInterval(intervalHandle);
         intervalHandle = null;
     }
-    // Phase 2: packs are manual Push only (no interval full-zip).
+    if (nestDiskAutosaveKickTimer) {
+        clearTimeout(nestDiskAutosaveKickTimer);
+        nestDiskAutosaveKickTimer = null;
+    }
+    // External ST: packs stay manual Push. Nest: same work as «Сохранить сейчас».
+    if (!isNestMode()) {
+        return;
+    }
+    intervalHandle = setInterval(nestDiskAutosaveTick, NEST_DISK_AUTOSAVE_MS);
+    nestDiskAutosaveKickTimer = setTimeout(nestDiskAutosaveTick, 15_000);
 }
 
 /**
@@ -2562,6 +2855,10 @@ function ensureNestLocaleDefault() {
     } catch (_) { /* ignore */ }
 }
 
+function chatLengthOf(c) {
+    return Array.isArray(c?.chat) ? c.chat.length : 0;
+}
+
 function rememberLoadedEntity(c, loaded) {
     if (!loaded) {
         loadedThisChid = undefined;
@@ -2570,6 +2867,7 @@ function rememberLoadedEntity(c, loaded) {
     }
     loadedThisChid = c.characterId ?? c.this_chid;
     loadedSelectedGroup = c.groupId ?? c.selected_group;
+    lastKnownChatLength = chatLengthOf(c);
 }
 
 function isStreamingNow() {
@@ -2586,39 +2884,230 @@ function isStreamingNow() {
     return false;
 }
 
+function openHomeSnapshot(c) {
+    return {
+        thisChid: c.characterId ?? c.this_chid,
+        selectedGroup: c.groupId ?? c.selected_group,
+        loadedThisChid,
+        loadedSelectedGroup,
+        chatLoaded: chatLoadedThisSession,
+        isChatSaving: !!isChatSaving,
+        isStreaming: isStreamingNow(),
+        menuType: c.menuType ?? c.menu_type,
+        chatLength: chatLengthOf(c),
+        lastKnownLength: lastKnownChatLength,
+    };
+}
+
+function worldEditorSelectedName() {
+    try {
+        if (typeof jQuery === 'function') {
+            const $sel = jQuery('#world_editor_select');
+            if (!$sel.length) return '';
+            return String($sel.val() ?? '').trim();
+        }
+        const sel = document.getElementById('world_editor_select');
+        if (!sel) return '';
+        return String(sel.value ?? '').trim();
+    } catch (_) {
+        return '';
+    }
+}
+
+function extraBooksForOpenCharacter(c) {
+    const lore = world_info?.charLore;
+    if (!Array.isArray(lore)) return [];
+    const char = c.characters?.[c.characterId];
+    const avatar = char?.avatar != null ? String(char.avatar) : '';
+    const fileName = avatar.replace(/\.[^/.]+$/, '');
+    const out = [];
+    for (const e of lore) {
+        const n = String(e?.name || '');
+        if (!n || (n !== fileName && n !== avatar)) continue;
+        if (Array.isArray(e.extraBooks)) out.push(...e.extraBooks);
+    }
+    return out;
+}
+
+function collectOpenWorldNames(c) {
+    const char = c.characters?.[c.characterId];
+    const meta = c.chatMetadata || c.chat_metadata || {};
+    return worldNamesToFlush({
+        selectedWorldInfo: Array.isArray(selected_world_info) ? selected_world_info : [],
+        chatWorld: meta.world_info,
+        characterWorld: char?.data?.extensions?.world,
+        extraBooks: extraBooksForOpenCharacter(c),
+        editorWorld: worldEditorSelectedName(),
+        personaWorld: c.powerUserSettings?.persona_description_lorebook,
+    });
+}
+
+async function triggerCharacterCardSave() {
+    try {
+        if (typeof createOrEditCharacter === 'function') {
+            await createOrEditCharacter();
+            return true;
+        }
+        if (typeof jQuery === 'function') {
+            jQuery('#create_button').trigger('click');
+            return true;
+        }
+        document.getElementById('create_button')?.click();
+        return true;
+    } catch (e) {
+        console.warn(LOG_PREFIX, 'character card save failed', e);
+        return false;
+    }
+}
+
+/**
+ * Persist open-home state to the live ST disk.
+ * includeExtras false = leave-flush (chat + settings only).
+ * includeExtras true = button «Сохранить сейчас» (also metadata, group, card, lorebooks).
+ * Not cloud Push, not zip, not freeze.
+ */
+async function persistOpenHomeNow({ includeExtras = false, persistSettings = true } = {}) {
+    const c = ctx();
+    const snap = openHomeSnapshot(c);
+    const chatOk = shouldFlushChat(snap);
+    let ok = true;
+
+    if (chatOk) {
+        try {
+            await saveChatConditional();
+            const n = chatLengthOf(c);
+            if (n > lastKnownChatLength) {
+                lastKnownChatLength = n;
+            }
+        } catch (e) {
+            ok = false;
+            console.warn(LOG_PREFIX, 'persist chat failed', e);
+        }
+        if (includeExtras && typeof c.saveMetadata === 'function') {
+            try {
+                await c.saveMetadata();
+            } catch (e) {
+                ok = false;
+                console.warn(LOG_PREFIX, 'persist metadata failed', e);
+            }
+        }
+    }
+
+    if (persistSettings && settingsHydrated) {
+        try {
+            await saveSettings();
+            lastSettingsPersistAt = Date.now();
+        } catch (e) {
+            ok = false;
+            console.warn(LOG_PREFIX, 'persist settings failed', e);
+        }
+    }
+
+    if (!includeExtras) {
+        return { includeExtras: false, ok };
+    }
+
+    if (shouldSaveGroupMeta(snap)) {
+        try {
+            await editGroup(snap.selectedGroup, true, false);
+        } catch (e) {
+            ok = false;
+            console.warn(LOG_PREFIX, 'persist group failed', e);
+        }
+    }
+
+    if (shouldSaveCharacterCard(snap)) {
+        if (!await triggerCharacterCardSave()) {
+            ok = false;
+        }
+    }
+
+    const editorBook = worldEditorSelectedName();
+    const names = collectOpenWorldNames(c);
+    for (const name of names) {
+        if (editorBook && name === editorBook) {
+            logLine(`save-now: skip lore editor book «${name}» (immediately=true would clobber unsaved WI edits)`);
+            continue;
+        }
+        try {
+            const load = typeof loadWorldInfo === 'function' ? loadWorldInfo : c.loadWorldInfo;
+            const save = typeof saveWorldInfo === 'function' ? saveWorldInfo : c.saveWorldInfo;
+            if (typeof load !== 'function' || typeof save !== 'function') {
+                logLine(`save-now: no load/saveWorldInfo for «${name}»`);
+                continue;
+            }
+            const book = await load(name);
+            if (!book) {
+                logLine(`save-now: lore load empty «${name}»`);
+                continue;
+            }
+            await save(name, book, true);
+        } catch (e) {
+            ok = false;
+            console.warn(LOG_PREFIX, `persist lore ${name} failed`, e);
+            logLine(`save-now lore ${name}: ${e?.message || e}`);
+        }
+    }
+    return { includeExtras: true, ok };
+}
+
+function releaseLeaveFlushMutex() {
+    leaveFlushInFlight = false;
+    if (leaveFlushPending) {
+        void flushOnLeave();
+    }
+}
+
 async function flushOnLeave() {
     const now = Date.now();
-    if (leaveFlushInFlight || (now - lastLeaveFlushAt) < 1500) {
+    const action = leaveFlushStartAction({
+        busy: leaveFlushInFlight,
+        debounceActive: (now - lastLeaveFlushAt) < 1500,
+        queued: leaveFlushPending,
+    });
+    if (action === 'queue') {
+        leaveFlushPending = true;
+        return;
+    }
+    if (action === 'skip') {
+        leaveFlushPending = false;
         return;
     }
     leaveFlushInFlight = true;
+    leaveFlushPending = false;
     lastLeaveFlushAt = now;
     try {
-        const c = ctx();
-        if (shouldFlushChat({
-            thisChid: c.characterId ?? c.this_chid,
-            selectedGroup: c.groupId ?? c.selected_group,
-            loadedThisChid,
-            loadedSelectedGroup,
-            chatLoaded: chatLoadedThisSession,
-            isChatSaving: !!isChatSaving,
-            isStreaming: isStreamingNow(),
-        })) {
-            try {
-                await saveChatConditional();
-            } catch (e) {
-                console.warn(LOG_PREFIX, 'leave flush chat failed', e);
-            }
-        }
-        if (settingsHydrated) {
-            try {
-                await saveSettings();
-            } catch (e) {
-                console.warn(LOG_PREFIX, 'leave flush settings failed', e);
-            }
-        }
+        await persistOpenHomeNow({ includeExtras: false });
     } finally {
-        leaveFlushInFlight = false;
+        releaseLeaveFlushMutex();
+    }
+}
+
+async function persistOpenHomeFromButton() {
+    if (leaveFlushInFlight) {
+        toast('info', 'Сохранение уже идёт…');
+        return;
+    }
+    leaveFlushInFlight = true;
+    const btn = document.getElementById('wucloud_nest_save_now');
+    if (btn) btn.disabled = true;
+    setStatus('Сохраняю открытый дом на диск…', 'busy');
+    try {
+        const result = await persistOpenHomeNow({ includeExtras: true });
+        if (result?.ok) {
+            noteDiskFingerprint();
+        }
+        setStatus('Дом записан на диск таверны', 'ok');
+        toast('success', 'Открытый дом сохранён на диск');
+        logLine('save-now: flushed open home to ST disk (not Push, not zip)');
+    } catch (e) {
+        const msg = e?.message || String(e);
+        setStatus(`Сохранить сейчас: ${msg}`, 'err');
+        toast('error', msg);
+        logLine(`save-now: ${msg}`);
+    } finally {
+        releaseLeaveFlushMutex();
+        if (btn) btn.disabled = false;
     }
 }
 
@@ -2645,7 +3134,15 @@ function bindEvents() {
         logLine('eventSource unavailable — autosave limited');
         return;
     }
-    const bump = () => scheduleAutosave();
+    const bump = () => {
+        try {
+            const n = chatLengthOf(ctx());
+            if (n > lastKnownChatLength) {
+                lastKnownChatLength = n;
+            }
+        } catch (_) { /* ignore */ }
+        scheduleAutosave();
+    };
     const types = [
         et.MESSAGE_RECEIVED, et.MESSAGE_SENT, et.MESSAGE_EDITED,
         et.MESSAGE_DELETED, et.MESSAGE_SWIPED, et.CHAT_CHANGED,
@@ -2806,7 +3303,11 @@ function isManagedNestHost() {
     try {
         if (typeof location === 'undefined') return false;
         const host = String(location.hostname || '').toLowerCase();
-        return host === 'nest.wuproj.com' || host.endsWith('.nest.wuproj.com');
+        if (!host) return false;
+        if (NEST_MANAGED_HOSTS.includes(host)) return true;
+        // Future Nest project domain(s): keep nest.* suffix for sibling subdomains.
+        if (host.endsWith('.nest.wuproj.com')) return true;
+        return false;
     } catch (_) {
         return false;
     }
@@ -3322,7 +3823,7 @@ function applyManagedUi() {
         modeBadge.classList.toggle('is-ext', !nest);
     }
     if (status && nest) {
-        status.textContent = 'Чаты на диске этой таверны. Облако — не live-копия. Сначала Export zip.';
+        status.textContent = 'Чаты на диске этой таверны. «Сохранить сейчас» пишет открытый дом на диск. Zip — Export zip здесь.';
         status.classList.add('is-ok');
         status.classList.remove('is-bad');
     }
@@ -3436,6 +3937,14 @@ function wireNestImportExport() {
     const file = document.getElementById('wucloud_nest_import_file');
     const cloud = document.getElementById('wucloud_nest_import_cloud');
     const wipe = document.getElementById('wucloud_nest_wipe');
+    const saveNow = document.getElementById('wucloud_nest_save_now');
+    if (saveNow && !saveNow.dataset.bound) {
+        saveNow.dataset.bound = '1';
+        saveNow.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            persistOpenHomeFromButton().catch(() => {});
+        });
+    }
     if (exp && !exp.dataset.bound) {
         exp.dataset.bound = '1';
         exp.addEventListener('click', (ev) => {
@@ -3512,6 +4021,11 @@ async function init() {
     bindEvents();
     bindLeaveFlush();
     settingsHydrated = true;
+    // Seed so the 15s kick does not dump ~10 MiB settings.json; leave-flush
+    // and Save Now still write settings. Autosave settings wait 10 minutes.
+    lastSettingsPersistAt = Date.now();
+    // Same idea as settingsAt: first idle tick must not look dirty.
+    noteDiskFingerprint();
     setupIntervalAutosave();
     // Late reapply if settings already loaded before our handlers bound
     setTimeout(() => reapplySelectedTheme('init'), 800);
@@ -3563,6 +4077,8 @@ function bootWuCloud() {
     } catch (_) { /* fall through */ }
     run();
 }
+
+installSessionCsrfWatch();
 
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', bootWuCloud);

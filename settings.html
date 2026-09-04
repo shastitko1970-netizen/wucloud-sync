@@ -1,7 +1,7 @@
 <div id="wucloud-sync-panel" class="wucloud-panel">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b><i class="fa-solid fa-cloud"></i> WuCloud <span class="wucloud-ver-badge" id="wucloud_ver_badge">0.14.5</span>
+            <b><i class="fa-solid fa-cloud"></i> WuCloud <span class="wucloud-ver-badge" id="wucloud_ver_badge">0.15.0</span>
                 <span id="wucloud_mode_badge" class="wucloud-mode-badge">…</span></b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
@@ -12,14 +12,27 @@
                     <div class="wucloud-managed__title">◆ Nest companion</div>
                     <p class="wucloud-managed__body">
                         Чаты живут <b>в этой таверне на диске</b>. Облако WuProj — не live-копия.
-                        Cloud Push/Pull <b>выкл</b>. Главное действие — <b>Export zip</b> на свой компьютер.
-                        LLM: <b>WuProj</b> → eco · <code>openai/gpt-5.4-nano</code>.
+                        <b>Сохранить сейчас</b> сбрасывает открытый дом (чат, настройки, карточку, lorebooks, группу)
+                        на диск этой таверны — не в облако и не в zip.
+                        На Nest это же сохранение идёт <b>само каждые 2 минуты</b> (открытая вкладка; тяжёлые settings — не чаще чем раз в 10 минут), плюс при уходе со страницы — чат и настройки.
+                        Zip = кнопка <b>Export zip</b> здесь же (скачать на свой компьютер, не второе хранилище).
+                        Кабинет gold — ключи и золото, не дом Nest.
+                        Cloud Push/Pull <b>выкл</b>. LLM: <b>WuProj</b> → eco · <code>openai/gpt-5.4-nano</code>.
                     </p>
                     <p id="wucloud_managed_key_status" class="wucloud-managed__status">…</p>
                     <div class="wucloud-quota">
                         <div class="wucloud-quota__label">Квота Nest (du FS)</div>
                         <div class="wucloud-quota__bar"><i id="wucloud_nest_quota_bar"></i></div>
                         <div id="wucloud_nest_quota" class="wucloud-quota__text">…</div>
+                    </div>
+                    <div class="wucloud-buttons wucloud-nest-primary" style="margin-top:6px">
+                        <a class="menu_button wucloud-portal-btn" href="/portal" target="_blank" rel="noopener">
+                            <i class="fa-solid fa-house"></i> Кабинет Nest
+                        </a>
+                        <button type="button" id="wucloud_nest_save_now" class="menu_button wucloud-save-now-btn"
+                            title="Записать открытый дом на диск этой таверны (не облако, не zip)">
+                            <i class="fa-solid fa-floppy-disk"></i> Сохранить сейчас
+                        </button>
                     </div>
                     <div class="wucloud-buttons" style="margin-top:6px">
                         <button type="button" id="wucloud_nest_export" class="menu_button" title="ST native zip backup">
@@ -52,7 +65,7 @@
                     </div>
                     <div class="wucloud-managed__links">
                         <a href="https://nest.wuproj.com/portal" target="_blank" rel="noopener">Портал / квота</a>
-                        <a href="https://wuproj.com/dashboard" target="_blank" rel="noopener">Кабинет</a>
+                        <a href="https://wuproj.com/dashboard" target="_blank" rel="noopener">Gold и ключи</a>
                         <a href="https://wuproj.com/gold" target="_blank" rel="noopener">wu-gold</a>
                     </div>
                     <p class="wucloud-hint" style="margin-top:8px">

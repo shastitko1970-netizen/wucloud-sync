@@ -236,6 +236,37 @@
     gap: 6px;
 }
 
+.wucloud-panel .wucloud-nest-primary .menu_button {
+    flex: 1 1 100%;
+}
+
+.wucloud-panel .wucloud-portal-btn {
+    background: color-mix(in srgb, #ef4444 22%, transparent) !important;
+    border-color: color-mix(in srgb, #ef4444 70%, transparent) !important;
+    color: #fecaca !important;
+    font-weight: 700;
+    text-decoration: none;
+}
+.wucloud-panel .wucloud-portal-btn:hover {
+    background: color-mix(in srgb, #ef4444 34%, transparent) !important;
+    color: #fff !important;
+}
+
+.wucloud-panel .wucloud-save-now-btn {
+    background: color-mix(in srgb, #34d399 18%, transparent) !important;
+    border-color: color-mix(in srgb, #34d399 65%, transparent) !important;
+    color: #6ee7b7 !important;
+    font-weight: 700;
+}
+.wucloud-panel .wucloud-save-now-btn:hover {
+    background: color-mix(in srgb, #34d399 28%, transparent) !important;
+    color: #ecfdf5 !important;
+}
+.wucloud-panel .wucloud-save-now-btn:disabled {
+    opacity: 0.55;
+    cursor: wait;
+}
+
 .wucloud-panel .wucloud-status {
     margin-top: 4px;
     padding: 10px 12px;
@@ -308,4 +339,137 @@
 
 .wucloud-panel .wucloud-foot a {
     text-decoration: underline;
+}
+
+/* ── Session hatch (CSRF 403 after nest-st recreate) ─────────────────
+   Cabin caution, not a generic modal. Soyuz if /portal/fonts is same-origin;
+   otherwise system-ui. Never dump tokens or cookies into this tree. */
+@font-face {
+    font-family: 'Soyuz Grotesk';
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url('/portal/fonts/Soyuz_Grotesk_Bold.woff') format('woff'),
+         url('/portal/fonts/Soyuz_Grotesk_Bold.otf') format('opentype');
+}
+
+.wucloud-session-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 2147483000;
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-start;
+    padding: clamp(20px, 6vh, 64px) clamp(16px, 5vw, 48px);
+    background:
+        radial-gradient(80% 60% at 12% 88%, color-mix(in srgb, #ef4444 18%, transparent), transparent 58%),
+        radial-gradient(70% 50% at 88% 8%, color-mix(in srgb, #34d399 8%, transparent), transparent 50%),
+        color-mix(in srgb, #050506 78%, transparent);
+    backdrop-filter: blur(10px) saturate(0.85);
+    -webkit-backdrop-filter: blur(10px) saturate(0.85);
+    animation: wucloud-hatch-in 0.28s ease-out;
+}
+
+@keyframes wucloud-hatch-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+.wucloud-session-overlay__card {
+    width: min(28rem, 100%);
+    padding: 22px 22px 18px;
+    border-radius: 4px 14px 14px 4px;
+    border: 1px solid color-mix(in srgb, #f59e0b 45%, #333);
+    border-left: 3px solid #f59e0b;
+    background:
+        linear-gradient(165deg, color-mix(in srgb, #1a1b20 92%, #ef4444), #121318 55%);
+    color: #f4f4f7;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+    animation: wucloud-hatch-card 0.32s ease-out;
+}
+
+@keyframes wucloud-hatch-card {
+    from { transform: translateY(12px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+}
+
+.wucloud-session-overlay__kicker {
+    margin: 0 0 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.68em;
+    font-weight: 600;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: #fbbf24;
+}
+
+.wucloud-session-overlay__title {
+    margin: 0 0 10px;
+    font-family: 'Soyuz Grotesk', ui-sans-serif, system-ui, sans-serif;
+    font-size: clamp(1.35rem, 3.2vw, 1.75rem);
+    font-weight: 700;
+    line-height: 1.15;
+    letter-spacing: 0.01em;
+}
+
+.wucloud-session-overlay__body {
+    margin: 0 0 18px;
+    font-size: 0.92em;
+    line-height: 1.45;
+    color: #c4c4cc;
+}
+
+.wucloud-session-overlay__reload {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    min-height: 44px;
+    padding: 10px 16px;
+    border-radius: 8px;
+    border: 1px solid color-mix(in srgb, #ef4444 70%, transparent);
+    background: color-mix(in srgb, #ef4444 22%, transparent);
+    color: #fecaca;
+    font-weight: 700;
+    font-size: 0.95em;
+    cursor: pointer;
+    touch-action: manipulation;
+}
+
+.wucloud-session-overlay__reload:hover,
+.wucloud-session-overlay__reload:focus-visible {
+    background: color-mix(in srgb, #ef4444 36%, transparent);
+    color: #fff;
+    outline: 2px solid #fbbf24;
+    outline-offset: 2px;
+}
+
+.wucloud-session-overlay__reload:disabled {
+    opacity: 0.55;
+    cursor: wait;
+}
+
+.wucloud-disk-toast {
+    position: fixed;
+    z-index: 2147482000;
+    left: clamp(12px, 4vw, 28px);
+    bottom: clamp(12px, 4vh, 28px);
+    padding: 8px 12px;
+    border-radius: 999px;
+    border: 1px solid color-mix(in srgb, #34d399 50%, transparent);
+    background: color-mix(in srgb, #101115 88%, #34d399);
+    color: #6ee7b7;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.75em;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    pointer-events: none;
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.wucloud-disk-toast.is-on {
+    opacity: 1;
+    transform: translateY(0);
 }
