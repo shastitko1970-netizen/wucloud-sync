@@ -56,7 +56,7 @@ const CLOUD_SIBLING_MODULES = Object.freeze(['wucloud-sync', 'nest-cloud']);
 const FOLDER = `third-party/${MODULE}`;
 const LOG_PREFIX = '[WuCloud]';
 const MAP_KEY = `${MODULE}_id_map`;
-const EXT_VERSION = '0.14.12';
+const EXT_VERSION = '0.15.3';
 
 /** True after a successful chat load this session (see chatLoadedAfterEvent). */
 let chatLoadedThisSession = false;
@@ -2755,6 +2755,8 @@ function installSessionCsrfWatch() {
 }
 
 function nestDiskAutosaveTick() {
+    // Never fight a multi‑GB import for nestmgr / ST disk.
+    if (nestImportRun && !nestImportRun.abort) return;
     const visible = typeof document === 'undefined'
         || document.visibilityState === 'visible';
     if (!shouldRunNestDiskAutosave({
@@ -3059,6 +3061,9 @@ function releaseLeaveFlushMutex() {
 }
 
 async function flushOnLeave() {
+    if (nestImportRun && !nestImportRun.abort) {
+        return;
+    }
     const now = Date.now();
     const action = leaveFlushStartAction({
         busy: leaveFlushInFlight,
@@ -3441,7 +3446,7 @@ async function nestExportZip() {
         a.click();
         URL.revokeObjectURL(url);
         setStatus(`Export: ${filename}`, 'ok');
-        toast('success', 'Backup zip скачан');
+        toast('success', 'Бэкап .zip скачан на компьютер');
         logLine(`export zip ok ${filename}`);
     } catch (e) {
         setStatus(`Export: ${e.message}`, 'err');
@@ -3460,33 +3465,41 @@ function looksLikeStBackup(name, type) {
 }
 
 /**
- * CF free/pro kills single POST >~100MB → "Failed to fetch".
- * 80MB: fewer round-trips than 48MB, still under CF limit with headroom.
- * Parallel POSTs fill the pipe better on Wi‑Fi (server flock-serializes assemble).
+ * CF free/pro: ~100MB body + ~100s proxy timeout. 80MB chunks on mobile die
+ * mid-POST → 502/timeout → user sees every part «restart». 16MB is safer.
  */
-const NEST_IMPORT_CHUNK = 80 * 1024 * 1024;
+const NEST_IMPORT_CHUNK_DEFAULT = 16 * 1024 * 1024;
+const NEST_IMPORT_CHUNK_MAX_RELIABLE = 24 * 1024 * 1024;
 const NEST_IMPORT_LS = 'wucloud_nest_import_v1';
-const NEST_IMPORT_CHUNK_RETRIES = 10;
-/** Default parallel chunk uploads; throttled on slow cellular. */
-const NEST_IMPORT_CONCURRENCY_MAX = 3;
+const NEST_IMPORT_CHUNK_RETRIES = 14;
+/** Sequential only — parallel multi‑MB POSTs reset nestmgr behind nginx. */
+const NEST_IMPORT_CONCURRENCY_MAX = 1;
+
+/** @type {{ abort: boolean } | null} */
+let nestImportRun = null;
 
 function nestImportSleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Adaptive parallelism: slow cell → 1, 3g → 2, else up to 3. */
-function nestImportConcurrency() {
+/** Smaller chunks on bad links = more resume checkpoints, under CF 100s. */
+function nestImportChunkBytes() {
     try {
         const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
         if (c) {
-            if (c.saveData) return 1;
+            if (c.saveData) return 8 * 1024 * 1024;
             const t = String(c.effectiveType || '').toLowerCase();
-            if (t === 'slow-2g' || t === '2g') return 1;
-            if (t === '3g') return 2;
+            if (t === 'slow-2g' || t === '2g') return 8 * 1024 * 1024;
+            if (t === '3g') return 12 * 1024 * 1024;
             const down = Number(c.downlink);
-            if (Number.isFinite(down) && down > 0 && down < 1.5) return 1;
+            if (Number.isFinite(down) && down > 0 && down < 1.5) return 10 * 1024 * 1024;
         }
     } catch (_) { /* */ }
+    return NEST_IMPORT_CHUNK_DEFAULT;
+}
+
+/** Nest import stays sequential (CF + nestmgr stability). */
+function nestImportConcurrency() {
     return NEST_IMPORT_CONCURRENCY_MAX;
 }
 
@@ -3508,15 +3521,26 @@ function nestImportClearSession() {
     try { localStorage.removeItem(NEST_IMPORT_LS); } catch (_) { /* */ }
 }
 
-function nestImportIsRetryable(err, status) {
-    if (status === 401 || status === 403 || status === 400 || status === 409 || status === 413) {
+function nestImportIsRetryable(err, status, payload) {
+    if (payload?.session_kept) return true;
+    if (payload?.session_cleared) return false;
+    const msg = String(err?.message || err || '').toLowerCase();
+    // Mid-body disconnect (was HTTP 400) — must retry, not abort whole import.
+    if (msg.includes('incomplete chunk')) return true;
+    if (status === 408 || status === 425) return true;
+    if (status === 401 || status === 403 || status === 413) {
         return false;
     }
-    if (status === 502 || status === 503 || status === 504 || status === 408 || status === 429) {
+    if (status === 400) {
+        return false;
+    }
+    if (status === 409) {
+        return false;
+    }
+    if (status === 502 || status === 503 || status === 504 || status === 429) {
         return true;
     }
     if (status && status >= 500) return true;
-    const msg = String(err?.message || err || '').toLowerCase();
     return (
         msg.includes('failed to fetch')
         || msg.includes('network')
@@ -3524,7 +3548,73 @@ function nestImportIsRetryable(err, status) {
         || msg.includes('timeout')
         || msg.includes('load failed')
         || msg.includes('connection')
+        || msg.includes('502')
+        || msg.includes('503')
     );
+}
+
+function nestImportFormatBytes(n) {
+    const b = Number(n) || 0;
+    if (b >= 1024 ** 3) return `${(b / (1024 ** 3)).toFixed(2)} ГБ`;
+    if (b >= 1024 ** 2) return `${(b / (1024 ** 2)).toFixed(1)} МБ`;
+    return `${Math.round(b / 1024)} КБ`;
+}
+
+async function nestImportRefreshResumeBanner() {
+    const box = document.getElementById('wucloud_nest_resume');
+    const text = document.getElementById('wucloud_nest_resume_text');
+    if (!box || !text || !isNestMode()) return;
+    const prev = nestImportLoadSession();
+    if (!prev?.upload_id || !prev.file_name) {
+        box.style.display = 'none';
+        box.hidden = true;
+        return;
+    }
+    try {
+        const stRes = await fetch(`/_nest/import-status?id=${encodeURIComponent(prev.upload_id)}`, {
+            credentials: 'include',
+            headers: { Accept: 'application/json' },
+        });
+        const st = await stRes.json().catch(() => ({}));
+        if (!stRes.ok || !st.exists || !(st.have_count > 0)) {
+            box.style.display = 'none';
+            box.hidden = true;
+            return;
+        }
+        const have = Number(st.have_count) || 0;
+        const chunks = Number(st.chunks || prev.chunks) || 0;
+        const pct = chunks ? Math.round((have / chunks) * 100) : 0;
+        const ttlH = st.ttl_sec_left != null ? Math.max(0, Math.round(Number(st.ttl_sec_left) / 3600)) : 48;
+        const fname = decodeURIComponent(String(prev.file_name || st.file_name || 'бэкап'));
+        text.textContent = `Недолитый бэкап «${fname}»: на сервере уже ${have}/${chunks} частей (~${pct}%, ${nestImportFormatBytes(st.have_bytes)}). `
+            + `Выберите тот же файл — докачаем остаток. Хранится ещё ~${ttlH} ч. `
+            + `«Отменить» удалит части с сервера.`;
+        box.hidden = false;
+        box.style.display = '';
+    } catch (_) {
+        box.style.display = 'none';
+        box.hidden = true;
+    }
+}
+
+async function nestImportAbortSession() {
+    const prev = nestImportLoadSession();
+    const id = prev?.upload_id;
+    nestImportClearSession();
+    if (nestImportRun) nestImportRun.abort = true;
+    if (id) {
+        try {
+            await fetch('/_nest/import-abort', {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ id }),
+            });
+        } catch (_) { /* */ }
+    }
+    await nestImportRefreshResumeBanner();
+    setStatus('Недолитый бэкап отменён', 'ok');
+    toast('info', 'Недолитый бэкап сброшен — можно начать заново');
 }
 
 /**
@@ -3534,11 +3624,15 @@ function nestImportIsRetryable(err, status) {
  */
 async function nestImportFromFile(file) {
     if (!isNestMode()) {
-        toast('warning', 'Import только на Nest');
+        toast('warning', 'Загрузка бэкапа в дом доступна только на Nest');
         return;
     }
     if (!file) {
         toast('warning', 'Файл не выбран');
+        return;
+    }
+    if (nestImportRun && !nestImportRun.abort) {
+        toast('info', 'Загрузка уже идёт — дождитесь или нажмите «Отменить недолитый бэкап»');
         return;
     }
     const name = String(file.name || 'backup.bin');
@@ -3548,11 +3642,36 @@ async function nestImportFromFile(file) {
         toast('warning', `Нужен .zip / .tar.gz (выбрано: ${name})`);
         return;
     }
-    const chunks = Math.max(1, Math.ceil(size / NEST_IMPORT_CHUNK) || 1);
+    // Resume must reuse chunk size — but pre-0.15.3 80MB chunks die on CF/mobile.
+    let prev = nestImportLoadSession();
+    let chunkBytes = nestImportChunkBytes();
+    if (
+        prev
+        && prev.file_name === name
+        && Number(prev.file_size) === size
+        && Number(prev.chunk_size) > 0
+        && Number(prev.chunk_size) <= NEST_IMPORT_CHUNK_MAX_RELIABLE
+    ) {
+        chunkBytes = Number(prev.chunk_size);
+    } else if (prev?.upload_id && Number(prev.chunk_size) > NEST_IMPORT_CHUNK_MAX_RELIABLE) {
+        logLine(`import migrate: drop oversized chunk_size=${prev.chunk_size} → ${chunkBytes}`);
+        try {
+            await fetch('/_nest/import-abort', {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                body: JSON.stringify({ id: prev.upload_id }),
+            });
+        } catch (_) { /* */ }
+        nestImportClearSession();
+        prev = null;
+        toast('info', 'Переключаю на мелкие части (стабильнее на телефоне) — заливка начнётся заново, зато без вечных обрывов');
+    }
+    const chunks = Math.max(1, Math.ceil(size / chunkBytes) || 1);
     // Prepare Blob slices BEFORE any await (Android File permission)
     const parts = [];
     for (let i = 0; i < chunks; i++) {
-        parts.push(file.slice(i * NEST_IMPORT_CHUNK, Math.min(size, (i + 1) * NEST_IMPORT_CHUNK)));
+        parts.push(file.slice(i * chunkBytes, Math.min(size, (i + 1) * chunkBytes)));
     }
 
     // Resume same file (name+size) with same upload_id if server still has chunks
@@ -3560,12 +3679,12 @@ async function nestImportFromFile(file) {
         ? crypto.randomUUID()
         : `u${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
     let haveSet = new Set();
-    const prev = nestImportLoadSession();
     if (
         prev
         && prev.file_name === name
         && Number(prev.file_size) === size
         && Number(prev.chunks) === chunks
+        && Number(prev.chunk_size) === chunkBytes
         && prev.upload_id
     ) {
         id = String(prev.upload_id);
@@ -3591,24 +3710,27 @@ async function nestImportFromFile(file) {
         file_name: name,
         file_size: size,
         chunks,
-        chunk_size: NEST_IMPORT_CHUNK,
+        chunk_size: chunkBytes,
     });
 
     const sizeLabel = mb >= 1024 ? `${(mb / 1024).toFixed(2)} ГБ` : `${mb.toFixed(1)} МБ`;
     const already = haveSet.size;
     setStatus(
         already
-            ? `Import: ${name} · resume ${already}/${chunks}…`
-            : `Import: ${name} (${sizeLabel}, 1/${chunks})…`,
+            ? `Загрузка бэкапа: ${name} · продолжаем ${already}/${chunks}…`
+            : `Загрузка бэкапа: ${name} (${sizeLabel}, части по ${Math.round(chunkBytes / (1024 * 1024))} МБ)…`,
         'busy',
     );
     toast(
         'info',
         already
-            ? `Продолжаем ${name}: уже ${already}/${chunks} чанков на сервере`
-            : `Загрузка ${name} (${sizeLabel})… экран лучше не гасить`,
+            ? `Продолжаем «${name}»: на сервере уже ${already}/${chunks}. Обрыв интернета — снова выберите этот же файл.`
+            : `Загрузка «${name}» (${sizeLabel}). Не гасите экран. Если оборвётся — выберите тот же файл, докачаем.`,
     );
-    logLine(`import start name=${name} size_mb=${mb.toFixed(2)} chunks=${chunks} id=${id} resume_have=${already}`);
+    logLine(`import start name=${name} size_mb=${mb.toFixed(2)} chunks=${chunks} chunk_mb=${(chunkBytes / (1024 * 1024)).toFixed(0)} id=${id} resume_have=${already}`);
+
+    const run = { abort: false };
+    nestImportRun = run;
 
     // Keep screen awake on mobile (best-effort; fails silently if denied)
     let wakeLock = null;
@@ -3627,6 +3749,7 @@ async function nestImportFromFile(file) {
     try { document.addEventListener('visibilitychange', onVis); } catch (_) { /* */ }
 
     const postChunk = async (i) => {
+        if (run.abort) throw new Error('загрузка отменена');
         const headers = {
             'Content-Type': 'application/octet-stream',
             'X-Nest-Upload-Id': id,
@@ -3641,6 +3764,7 @@ async function nestImportFromFile(file) {
 
         let lastErr = null;
         for (let attempt = 1; attempt <= NEST_IMPORT_CHUNK_RETRIES; attempt++) {
+            if (run.abort) throw new Error('загрузка отменена');
             try {
                 const res = await fetch('/_nest/import', {
                     method: 'POST',
@@ -3653,7 +3777,9 @@ async function nestImportFromFile(file) {
                     const hint = data.error || `HTTP ${res.status}`;
                     const err = new Error(res.status === 401 ? `${hint} — войдите снова` : hint);
                     err.status = res.status;
-                    if (!nestImportIsRetryable(err, res.status) || attempt === NEST_IMPORT_CHUNK_RETRIES) {
+                    err.payload = data;
+                    if (data.session_cleared) nestImportClearSession();
+                    if (!nestImportIsRetryable(err, res.status, data) || attempt === NEST_IMPORT_CHUNK_RETRIES) {
                         throw err;
                     }
                     lastErr = err;
@@ -3663,14 +3789,15 @@ async function nestImportFromFile(file) {
             } catch (e) {
                 lastErr = e;
                 const status = e?.status;
-                if (!nestImportIsRetryable(e, status) || attempt === NEST_IMPORT_CHUNK_RETRIES) {
+                const payload = e?.payload;
+                if (!nestImportIsRetryable(e, status, payload) || attempt === NEST_IMPORT_CHUNK_RETRIES) {
                     throw e;
                 }
             }
-            // Exponential backoff: 1s, 2s, 4s… cap 30s (network blip / screen wake)
-            const delay = Math.min(30000, 1000 * (2 ** (attempt - 1)));
+            // Exponential backoff: 1s, 2s, 4s… cap 45s (network blip / screen wake)
+            const delay = Math.min(45000, 1000 * (2 ** (attempt - 1)));
             setStatus(
-                `Import: обрыв чанка ${i + 1}/${chunks}, повтор ${attempt}/${NEST_IMPORT_CHUNK_RETRIES} через ${Math.round(delay / 1000)}с…`,
+                `Загрузка бэкапа: обрыв части ${i + 1}/${chunks}, повтор ${attempt}/${NEST_IMPORT_CHUNK_RETRIES} через ${Math.round(delay / 1000)}с… (можно выбрать тот же файл позже)`,
                 'busy',
             );
             logLine(`import retry chunk=${i + 1} attempt=${attempt} wait_ms=${delay} err=${lastErr?.message || lastErr}`);
@@ -3679,7 +3806,7 @@ async function nestImportFromFile(file) {
                 file_name: name,
                 file_size: size,
                 chunks,
-                chunk_size: NEST_IMPORT_CHUNK,
+                chunk_size: chunkBytes,
                 last_chunk: i,
             });
             await nestImportSleep(delay);
@@ -3719,7 +3846,7 @@ async function nestImportFromFile(file) {
             const mibs = liveBytes / (1024 * 1024) / elapsed;
             const speed = mibs >= 0.05 ? ` · ~${mibs.toFixed(1)} МиБ/с` : '';
             const par = conc > 1 ? ` ×${inFlight.size || conc}` : '';
-            setStatus(`Import: ${name} · ${doneCount}/${chunks} (${pct}%)${par}${speed}`, 'busy');
+            setStatus(`Загрузка бэкапа: ${name} · ${doneCount}/${chunks} (${pct}%)${par}${speed}`, 'busy');
         };
 
         const runOne = async (i) => {
@@ -3741,7 +3868,7 @@ async function nestImportFromFile(file) {
                     file_name: name,
                     file_size: size,
                     chunks,
-                    chunk_size: NEST_IMPORT_CHUNK,
+                    chunk_size: chunkBytes,
                     last_ok_chunk: i,
                 });
                 if (chunkData.done) {
@@ -3780,8 +3907,11 @@ async function nestImportFromFile(file) {
             ((typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now()) - t0
         ) / 1000);
         const avg = (liveBytes / (1024 * 1024) / elapsed).toFixed(1);
-        setStatus(`Import: ${data.files || 0} files (${data.format || '?'}) → ${data.handle} · ${avg} МиБ/с`, 'ok');
-        toast('success', 'Импорт готов — reload');
+        setStatus(
+            `Бэкап загружен: ${data.files || 0} файлов (${data.format || '?'}) → ${data.handle} · ${avg} МиБ/с. Обновляю страницу…`,
+            'ok',
+        );
+        toast('success', 'Бэкап загружен на Nest — страница обновится, затем откройте список чатов');
         logLine(`import ok files=${data.files} format=${data.format} chunks=${chunks} conc=${conc} avg_mib_s=${avg}`);
         refreshNestUsage();
         setTimeout(() => { try { location.reload(); } catch (_) { /* */ } }, 1200);
@@ -3792,16 +3922,18 @@ async function nestImportFromFile(file) {
         if (permanent || /invalid header/i.test(msg)) {
             nestImportClearSession();
             const hint = /invalid header|gzip|json/i.test(msg)
-                ? ' Это не ST zip (часто WuCloud JSON.gz). Нажмите «Из облака» или Push полный Backup zip с локальной ST.'
+                ? ' Нужен обычный zip-бэкап SillyTavern. Если pack уже в WuProj — нажмите «Подтянуть из облака WuProj».'
                 : '';
-            setStatus(`Import: ${msg}`, 'err');
+            setStatus(`Загрузка бэкапа: ${msg}`, 'err');
             toast('error', msg + hint);
         } else {
-            setStatus(`Import: ${msg} (можно выбрать тот же файл — продолжим)`, 'err');
-            toast('error', `${msg}. Выберите тот же файл снова — с места обрыва.`);
+            setStatus(`Загрузка бэкапа: ${msg} (выберите тот же файл ещё раз — продолжим)`, 'err');
+            toast('error', `${msg}. Выберите тот же файл снова — загрузка продолжится с места обрыва.`);
         }
         logLine(`import: ${msg}${permanent || /invalid header/i.test(msg) ? ' (session cleared)' : ''}`);
+        nestImportRefreshResumeBanner().catch(() => {});
     } finally {
+        if (nestImportRun === run) nestImportRun = null;
         try { document.removeEventListener('visibilitychange', onVis); } catch (_) { /* */ }
         try { await wakeLock?.release?.(); } catch (_) { /* */ }
     }
@@ -3823,7 +3955,7 @@ function applyManagedUi() {
         modeBadge.classList.toggle('is-ext', !nest);
     }
     if (status && nest) {
-        status.textContent = 'Чаты на диске этой таверны. «Сохранить сейчас» пишет открытый дом на диск. Zip — Export zip здесь.';
+        status.textContent = 'Чаты на диске Nest. Бэкап — зелёная кнопка ниже. Обрыв сети: тот же файл → докачка.';
         status.classList.add('is-ok');
         status.classList.remove('is-bad');
     }
@@ -3835,6 +3967,7 @@ function applyManagedUi() {
     if (nest) {
         refreshNestUsage();
         wireNestImportExport();
+        nestImportRefreshResumeBanner().catch(() => {});
     }
 }
 
@@ -3845,11 +3978,11 @@ function applyManagedUi() {
  */
 async function nestImportFromCloudPack() {
     if (!isNestMode()) {
-        toast('warning', 'Import из облака только на Nest');
+        toast('warning', 'Подтянуть из облака можно только на Nest');
         return;
     }
     nestImportClearSession();
-    setStatus('Import: pack из WuCloud…', 'busy');
+    setStatus('Подтягиваю последний pack из облака WuProj…', 'busy');
     logLine('import-cloud: start');
     try {
         const res = await fetch('/_nest/import-cloud', {
@@ -3866,7 +3999,7 @@ async function nestImportFromCloudPack() {
             `Import cloud: ${data.files || 0} files (${data.format || '?'}) · ${data.source_file || ''}`,
             'ok',
         );
-        toast('success', `Из облака: ${data.files || 0} файлов — reload`);
+        toast('success', `Из облака: ${data.files || 0} файлов — страница обновится`);
         logLine(`import-cloud ok files=${data.files} format=${data.format} src=${data.source_file}`);
         refreshNestUsage();
         setTimeout(() => { try { location.reload(); } catch (_) { /* */ } }, 1200);
@@ -3982,6 +4115,14 @@ function wireNestImportExport() {
             nestWipeAllData();
         });
     }
+    const abortBtn = document.getElementById('wucloud_nest_import_abort');
+    if (abortBtn && !abortBtn.dataset.bound) {
+        abortBtn.dataset.bound = '1';
+        abortBtn.addEventListener('click', (ev) => {
+            ev.preventDefault();
+            nestImportAbortSession().catch(() => {});
+        });
+    }
 }
 
 async function init() {
@@ -4033,7 +4174,7 @@ async function init() {
     const keyOk = apiKey().startsWith('wu-');
     logLine(`WuCloud ${EXT_VERSION} mode=${mode} · nestHost=${managed} · key=${keyOk ? 'yes' : 'n/a'} · BYTEA_sync=${mode === 'external' ? 'on' : 'OFF'}`);
     if (mode === 'nest') {
-        setStatus(`Nest companion ${EXT_VERSION} · без cloud sync`, 'ok');
+        setStatus(`NestCloud ${EXT_VERSION} · дом на диске · бэкап — кнопка «Загрузить бэкап с компьютера»`, 'ok');
         toast('info', `WuCloud Nest · live data на диске ST`);
     } else {
         setStatus(keyOk ? `External bridge ${EXT_VERSION}` : `External · нет ключа`, keyOk ? 'ok' : 'err');

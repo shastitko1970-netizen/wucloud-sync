@@ -50,6 +50,62 @@
 }
 .wucloud-panel .wucloud-managed__links a:hover { opacity: 1; }
 
+.wucloud-panel .wucloud-howto {
+    margin-top: 4px;
+    padding: 10px 10px 8px;
+    border-radius: 8px;
+    border: 1px solid color-mix(in srgb, #34d399 35%, transparent);
+    background: color-mix(in srgb, #34d399 8%, transparent);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.wucloud-panel .wucloud-howto--alt {
+    border-color: color-mix(in srgb, #60a5fa 35%, transparent);
+    background: color-mix(in srgb, #60a5fa 8%, transparent);
+}
+.wucloud-panel .wucloud-howto__steps {
+    margin: 0;
+    padding-left: 1.3em;
+    font-size: 0.86em;
+    line-height: 1.45;
+}
+.wucloud-panel .wucloud-howto__steps li {
+    margin: 0.35em 0;
+}
+.wucloud-panel .wucloud-hint--soft {
+    background: color-mix(in srgb, currentColor 6%, transparent);
+    border-style: solid;
+    border-color: color-mix(in srgb, currentColor 18%, transparent);
+    opacity: 0.95;
+}
+.wucloud-panel .wucloud-import-primary {
+    background: color-mix(in srgb, #34d399 22%, transparent) !important;
+    border-color: color-mix(in srgb, #34d399 70%, transparent) !important;
+    color: #a7f3d0 !important;
+    font-weight: 650 !important;
+}
+.wucloud-panel .wucloud-import-primary:hover {
+    background: color-mix(in srgb, #34d399 34%, transparent) !important;
+    color: #ecfdf5 !important;
+}
+
+.wucloud-panel .wucloud-resume {
+    margin-top: 4px;
+    padding: 10px;
+    border-radius: 8px;
+    border: 1px solid color-mix(in srgb, #fbbf24 50%, transparent);
+    background: color-mix(in srgb, #fbbf24 12%, transparent);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.wucloud-panel .wucloud-resume__text {
+    margin: 0;
+    font-size: 0.86em;
+    line-height: 1.45;
+}
+
 .wucloud-panel .wucloud-quota { margin-top: 4px; }
 .wucloud-panel .wucloud-quota__label {
     font-size: 0.8em; font-weight: 600; opacity: 0.85; margin-bottom: 4px;

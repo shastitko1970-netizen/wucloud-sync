@@ -1,7 +1,7 @@
 <div id="wucloud-sync-panel" class="wucloud-panel">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b><i class="fa-solid fa-cloud"></i> WuCloud <span class="wucloud-ver-badge" id="wucloud_ver_badge">0.15.0</span>
+            <b><i class="fa-solid fa-cloud"></i> WuCloud <span class="wucloud-ver-badge" id="wucloud_ver_badge">0.15.3</span>
                 <span id="wucloud_mode_badge" class="wucloud-mode-badge">…</span></b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
@@ -9,57 +9,115 @@
             <div class="wucloud-settings">
                 <!-- Nest companion: live FS, no BYTEA -->
                 <div id="wucloud_managed_banner" class="wucloud-managed" style="display:none;">
-                    <div class="wucloud-managed__title">◆ Nest companion</div>
+                    <div class="wucloud-managed__title">◆ NestCloud — ваш дом в таверне</div>
                     <p class="wucloud-managed__body">
-                        Чаты живут <b>в этой таверне на диске</b>. Облако WuProj — не live-копия.
-                        <b>Сохранить сейчас</b> сбрасывает открытый дом (чат, настройки, карточку, lorebooks, группу)
-                        на диск этой таверны — не в облако и не в zip.
-                        На Nest это же сохранение идёт <b>само каждые 2 минуты</b> (открытая вкладка; тяжёлые settings — не чаще чем раз в 10 минут), плюс при уходе со страницы — чат и настройки.
-                        Zip = кнопка <b>Export zip</b> здесь же (скачать на свой компьютер, не второе хранилище).
-                        Кабинет gold — ключи и золото, не дом Nest.
-                        Cloud Push/Pull <b>выкл</b>. LLM: <b>WuProj</b> → eco · <code>openai/gpt-5.4-nano</code>.
+                        Чаты и персонажи лежат <b>на диске этой таверны</b>.
+                        Облако WuProj сюда само не подтягивается — бэкап нужно загрузить кнопкой ниже.
                     </p>
                     <p id="wucloud_managed_key_status" class="wucloud-managed__status">…</p>
                     <div class="wucloud-quota">
-                        <div class="wucloud-quota__label">Квота Nest (du FS)</div>
+                        <div class="wucloud-quota__label">Занято места (квота Nest)</div>
                         <div class="wucloud-quota__bar"><i id="wucloud_nest_quota_bar"></i></div>
                         <div id="wucloud_nest_quota" class="wucloud-quota__text">…</div>
                     </div>
+
+                    <div class="wucloud-howto">
+                        <div class="wucloud-section-title">Как загрузить бэкап на Nest</div>
+                        <ol class="wucloud-howto__steps">
+                            <li>На телефоне или компьютере должен быть файл бэкапа SillyTavern —
+                                обычно <b>.zip</b> (скачали раньше из Nest или из своей локальной ST).</li>
+                            <li>Нажмите зелёную кнопку
+                                <b>«Загрузить бэкап с компьютера»</b> и выберите этот файл.</li>
+                            <li>Смотрите статус ниже: пока идёт загрузка — «занято», когда готово —
+                                страница <b>обновится сама</b>. После этого откройте список чатов.</li>
+                            <li>Если интернет оборвался на середине — <b>не паникуйте</b>: выберите
+                                <b>тот же файл</b> ещё раз. Уже залитые части (до ~48 часов) на сервере
+                                останутся, докачается только недостающее. Не начинайте с другого файла.</li>
+                        </ol>
+                        <div id="wucloud_nest_resume" class="wucloud-resume" style="display:none;" hidden>
+                            <p class="wucloud-resume__text" id="wucloud_nest_resume_text">…</p>
+                            <div class="wucloud-buttons">
+                                <label class="menu_button wucloud-file-label wucloud-import-primary"
+                                    for="wucloud_nest_import_file"
+                                    title="Выберите тот же .zip — продолжим с места обрыва">
+                                    <i class="fa-solid fa-play"></i> Продолжить тем же файлом
+                                </label>
+                                <button type="button" id="wucloud_nest_import_abort" class="menu_button wucloud-stop-btn"
+                                    title="Сбросить недолитый бэкап на сервере">
+                                    <i class="fa-solid fa-xmark"></i> Отменить недолитый бэкап
+                                </button>
+                            </div>
+                        </div>
+                        <p class="wucloud-hint wucloud-hint--soft">
+                            Подходят: <b>.zip</b>, <b>.tar.gz</b>.
+                            Не подходит: папка без архива, скриншот, одиночный <code>.json</code> чата.
+                            На телефоне лучше не гасить экран и не сворачивать браузер до конца загрузки.
+                        </p>
+                        <!-- Android: never use button→input.click(). Label/for required.
+                             No accept= — Android often greys out .zip as octet-stream. -->
+                        <div class="wucloud-buttons wucloud-nest-primary" style="margin-top:8px">
+                            <label id="wucloud_nest_import" class="menu_button wucloud-file-label wucloud-import-primary"
+                                for="wucloud_nest_import_file"
+                                title="Выберите .zip бэкап SillyTavern с компьютера или телефона">
+                                <i class="fa-solid fa-file-arrow-up"></i> Загрузить бэкап с компьютера
+                                <input type="file" id="wucloud_nest_import_file" class="wucloud-file-input" />
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="wucloud-howto wucloud-howto--alt">
+                        <div class="wucloud-section-title">Если бэкап уже в облаке WuProj</div>
+                        <p class="wucloud-managed__body">
+                            Только если раньше с <b>локальной</b> SillyTavern делали Push pack в облако WuProj.
+                            Тогда файл с диска выбирать не нужно:
+                        </p>
+                        <div class="wucloud-buttons" style="margin-top:6px">
+                            <button id="wucloud_nest_import_cloud" class="menu_button" type="button"
+                                title="Взять последний pack из облака WuProj без выбора файла">
+                                <i class="fa-solid fa-cloud-arrow-down"></i> Подтянуть из облака WuProj
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="wucloud-section-title">Скачать копию себе</div>
+                    <p class="wucloud-managed__body">
+                        Снимок текущего дома на компьютер (на всякий случай перед переносом или очисткой).
+                    </p>
+                    <div class="wucloud-buttons" style="margin-top:6px">
+                        <button type="button" id="wucloud_nest_export" class="menu_button"
+                            title="Скачать zip-бэкап дома на этот компьютер">
+                            <i class="fa-solid fa-file-zipper"></i> Скачать бэкап (.zip)
+                        </button>
+                    </div>
+
+                    <div class="wucloud-section-title">Обычные действия</div>
                     <div class="wucloud-buttons wucloud-nest-primary" style="margin-top:6px">
-                        <a class="menu_button wucloud-portal-btn" href="/portal" target="_blank" rel="noopener">
+                        <button type="button" id="wucloud_nest_save_now" class="menu_button wucloud-save-now-btn"
+                            title="Записать открытый чат и настройки на диск Nest (не в облако)">
+                            <i class="fa-solid fa-floppy-disk"></i> Сохранить сейчас на диск
+                        </button>
+                        <a class="menu_button wucloud-portal-btn"
+                            href="https://nest.wuproj.com/account"
+                            target="_blank" rel="noopener noreferrer">
                             <i class="fa-solid fa-house"></i> Кабинет Nest
                         </a>
-                        <button type="button" id="wucloud_nest_save_now" class="menu_button wucloud-save-now-btn"
-                            title="Записать открытый дом на диск этой таверны (не облако, не zip)">
-                            <i class="fa-solid fa-floppy-disk"></i> Сохранить сейчас
-                        </button>
                     </div>
-                    <div class="wucloud-buttons" style="margin-top:6px">
-                        <button type="button" id="wucloud_nest_export" class="menu_button" title="ST native zip backup">
-                            <i class="fa-solid fa-file-zipper"></i> Export zip
-                        </button>
-                        <!-- Android: never use button→input.click(). Label/for or overlay input is required
-                             so the tap is a real user gesture on <input type=file>. No accept= filter —
-                             Android often marks .zip as application/octet-stream and greys them out. -->
-                        <button id="wucloud_nest_import_cloud" class="menu_button" type="button" title="Взять последний pack из WuCloud (без загрузки файла)">
-                            <i class="fa-solid fa-cloud-arrow-down"></i> Из облака
-                        </button>
-                        <label id="wucloud_nest_import" class="menu_button wucloud-file-label" for="wucloud_nest_import_file" title="Распаковать ST backup (.zip / .tar.gz / WuCloud pack) в дом Nest">
-                            <i class="fa-solid fa-file-import"></i> Import
-                            <input type="file" id="wucloud_nest_import_file" class="wucloud-file-input" />
-                        </label>
-                    </div>
+                    <p class="wucloud-hint wucloud-hint--soft" style="margin-top:8px">
+                        Автосохранение на диск: примерно каждые 2 минуты, пока вкладка открыта.
+                        Кабинет — профиль и квота, не загрузка бэкапа.
+                        Ключи и золото: <a href="https://wuproj.com/dashboard" target="_blank" rel="noopener">WuApi Dashboard</a>.
+                    </p>
+
                     <div class="wucloud-danger-zone">
                         <div class="wucloud-section-title" style="color:#fca5a5">Опасная зона</div>
                         <p class="wucloud-hint">
-                            <b>Полная очистка Nest</b> удаляет <b>всё</b> в доме: чаты,
-                            персонажи, бэкапы ST, settings, extensions, worlds…
-                            Аккаунт WuAuth остаётся. После wipe — чистый Nest + stock seed.
+                            <b>Стереть весь дом Nest</b> удаляет чаты, персонажей, настройки, worlds, расширения.
+                            Аккаунт входа останется. Сначала лучше «Скачать бэкап (.zip)».
                         </p>
                         <div class="wucloud-buttons">
                             <button type="button" id="wucloud_nest_wipe" class="menu_button wucloud-stop-btn"
                                 title="Полностью очистить дом Nest (необратимо)">
-                                <i class="fa-solid fa-skull-crossbones"></i> Wipe all Nest data
+                                <i class="fa-solid fa-skull-crossbones"></i> Стереть весь дом Nest
                             </button>
                         </div>
                     </div>
@@ -68,11 +126,6 @@
                         <a href="https://wuproj.com/dashboard" target="_blank" rel="noopener">Gold и ключи</a>
                         <a href="https://wuproj.com/gold" target="_blank" rel="noopener">wu-gold</a>
                     </div>
-                    <p class="wucloud-hint" style="margin-top:8px">
-                        <b>Из облака</b> = последний WuCloud pack с сервера (рекомендуется после Push с локальной ST).
-                        Import файла: <b>.zip</b> / <b>.tar.gz</b> / WuCloud <b>.json.gz</b>.
-                        После импорта — hard reload.
-                    </p>
                 </div>
 
                 <!-- External bridge: pack push/pull (Phase 2) -->
@@ -136,9 +189,9 @@
                 <div class="wucloud-section-title">
                     Журнал WuCloud
                     <span class="wucloud-log-actions">
-                        <button type="button" id="wucloud_log_copy" class="menu_button wucloud-mini-btn" title="Скопировать журнал">Copy</button>
-                        <button type="button" id="wucloud_log_clear" class="menu_button wucloud-mini-btn" title="Очистить">Clear</button>
-                        <button type="button" id="wucloud_log_popup" class="menu_button wucloud-mini-btn" title="Открыть большим окном">Full</button>
+                        <button type="button" id="wucloud_log_copy" class="menu_button wucloud-mini-btn" title="Скопировать журнал">Копировать</button>
+                        <button type="button" id="wucloud_log_clear" class="menu_button wucloud-mini-btn" title="Очистить">Очистить</button>
+                        <button type="button" id="wucloud_log_popup" class="menu_button wucloud-mini-btn" title="Открыть большим окном">Полный</button>
                     </span>
                 </div>
                 <pre id="wucloud_log" class="wucloud-log" aria-live="polite"></pre>
